@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+from app.agent.verifier import verify_quotes
+from app.agent.answerer import draft_answer
+
+
+def test_quote_verifier_accepts_exact_span():
+    pages = {1: "The refund window is fourteen days for unused items."}
+    ok, failures = verify_quotes(
+        [{"text": "refund window is fourteen days", "page": 1}],
+        pages,
+    )
+    assert ok is True
+    assert failures == []
+
+
+def test_quote_verifier_rejects_fabricated_quotes():
+    pages = {1: "The refund window is fourteen days for unused items."}
+    ok, failures = verify_quotes(
+        [{"text": "Customers may teleport instantly", "page": 1}],
+        pages,
+    )
+    assert ok is False
+    assert failures
+
+
+def test_quote_verifier_rejects_altered_number():
+    pages = {1: "The refund window is 14 days for unused items."}
+    ok, failures = verify_quotes(
+        [{"text": "The refund window is 90 days for unused items.", "page": 1}],
+        pages,
+    )
+    assert ok is False
+    assert failures
+
+
+def test_quote_verifier_rejects_removed_negation():
+    pages = {1: "Employees are not eligible for refunds."}
+    ok, failures = verify_quotes(
+        [{"text": "Employees are eligible for refunds.", "page": 1}],
+        pages,
+    )
+    assert ok is False
+    assert failures
+
+
+def test_quote_verifier_rejects_one_character_quote():
+    pages = {1: "The refund window is 14 days."}
+    ok, failures = verify_quotes(
+        [{"text": "a", "page": 1}],
+        pages,
+    )
+    assert ok is False
+    assert failures
+
+
+def test_quote_verifier_rejects_substring_inside_longer_word():
+    pages = {1: "Workers are ineligible for early refunds under this policy."}
+    ok, failures = verify_quotes(
+        [{"text": "eligible", "page": 1}],
+        pages,
+    )
+    assert ok is False
+    assert failures
+
+
+def test_draft_rejects_empty_ok_answer(monkeypatch):
+    from app.agent import answerer as answerer_mod
+
+    class _FakeLLM:
+        def complete_json(self, *args, **kwargs):
+            return {
+                "status": "ok",
+                "answer": "   ",
+                "quotes": [{"page": 1, "text": "refund window is fourteen days"}],
+            }
+
+    monkeypatch.setattr(answerer_mod, "get_llm", lambda: _FakeLLM())
+    draft = draft_answer(
+        question="What is the refund window?",
+        plan={"intent": "fact", "format_card": "", "rewritten": "", "qtype": "fact"},
+        pages={1: "The refund window is fourteen days."},
+        unused_candidates=[],
+        budget_left=0,
+    )
+    assert draft["status"] == "insufficient_information"
+    assert draft.get("error") == "empty_answer"

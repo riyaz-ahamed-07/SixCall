@@ -1,0 +1,12 @@
+pymupdf>=1.24.0
+python-dotenv>=1.0.0
+litellm>=1.60.0
+pydantic>=2.0.0
+rapidfuzz>=3.0.0
+snowballstemmer>=2.2.0
+nltk==3.10.3
+pytest>=8.0.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+psycopg[binary]>=3.2
