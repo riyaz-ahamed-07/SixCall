@@ -3,14 +3,23 @@ from __future__ import annotations
 import re
 from typing import Any
 
+# Evidence spans are built in pure Python over already-fetched pages
+# (O(pages × sentences)). This layer has to stay sub-millisecond: ask latency
+# is model round-trips, not span building and not the keyword inverted index.
+
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 _MAX_QUOTE_WORDS = 45
 _MAX_CODE_QUOTE_WORDS = 120
 _MIN_SPAN_CHARS = 8
-# Per page, so a long early page cannot fill the list and starve an amendment.
+# Per-page budget is the real cap. A long page 1 must not consume every id
+# before an amendment page is numbered. The global cap is only a backstop.
 _MAX_SPANS_PER_PAGE = 8
 _MAX_SPANS = 32
 _SHORT_QUOTE_WORDS = 18
+# Free-text citations are not the primary path. A retyped quote is kept only
+# when it is this close to one span on the cited page, and it is rewritten to
+# that span's id.
+_SNAP_MIN = 90
 
 _CODE_LINE_RE = re.compile(
     r"(^\s{2,})"
@@ -74,33 +83,67 @@ def build_evidence_spans(pages: dict[int, str]) -> list[dict[str, Any]]:
     return spans
 
 
+def _snap_to_span(
+    text: str,
+    page: int,
+    spans_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Map a retyped quote onto one span on ``page``, or reject it.
+
+    Exact fragments are rewritten to that span. Anything else must score
+    rapidfuzz ≥90 against the span with the same numbers and negations.
+    """
+    from app.agent.verifier import fragment_of_span, near_span
+
+    if len(" ".join((text or "").split())) < _MIN_SPAN_CHARS:
+        return None
+    on_page = [s for s in spans_by_id.values() if int(s.get("page") or 0) == page]
+    containing = [
+        s for s in on_page if fragment_of_span(text, str(s.get("text") or ""))
+    ]
+    if containing:
+        return min(containing, key=lambda s: len(str(s.get("text") or "")))
+    close = [s for s in on_page if near_span(text, str(s.get("text") or ""), minimum=_SNAP_MIN)]
+    if not close:
+        return None
+    return min(close, key=lambda s: len(str(s.get("text") or "")))
+
+
 def resolve_quote_refs(
     quotes_raw: list[Any],
     spans_by_id: dict[str, dict[str, Any]],
     pages: dict[int, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Map model quote objects to exact {page, text} using evidence ids when present."""
+    """Accept evidence ids. Unknown ids are dropped. Free text is only kept
+    when it snaps to a span at ≥90 and is rewritten to that span's id.
+    """
+    del pages  # citations are the span text; do not lengthen past the id
     quotes: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for q in quotes_raw:
         if not isinstance(q, dict):
             continue
         eid = str(q.get("id") or q.get("evidence_id") or "").strip().upper()
-        if eid and eid in spans_by_id:
-            span = spans_by_id[eid]
-            quotes.append({"text": span["text"], "page": span["page"], "id": eid})
+        if eid:
+            span = spans_by_id.get(eid)
+            if span is None or eid in seen:
+                continue
+            seen.add(eid)
+            quotes.append({"text": span["text"], "page": int(span["page"]), "id": eid})
             continue
         text = str(q.get("text") or "").strip()
         try:
             page = int(q.get("page"))
         except (TypeError, ValueError):
             continue
-        if text:
-            item: dict[str, Any] = {"text": text, "page": page}
-            if eid:
-                item["id"] = eid
-            quotes.append(item)
-    if pages:
-        quotes = extend_quotes(quotes, pages)
+        span = _snap_to_span(text, page, spans_by_id)
+        if span is None:
+            continue
+        sid = str(span["id"]).upper()
+        if sid in seen:
+            continue
+        seen.add(sid)
+        quotes.append({"text": span["text"], "page": int(span["page"]), "id": sid})
     return quotes
 
 

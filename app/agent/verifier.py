@@ -65,6 +65,66 @@ def quote_matches_page(quote: str, page_text: str) -> bool:
     return _has_bounded_span(p_norm, q_norm)
 
 
+_DIGIT_RE = re.compile(r"\d+")
+_NEGATION_RE = re.compile(
+    r"\b(?:not|no|never|none|without|cannot|can't|dont|don't|doesnt|doesn't)\b",
+    re.I,
+)
+
+
+def _fuzz_ratio(left: str, right: str) -> int:
+    from rapidfuzz.fuzz import ratio
+
+    return int(ratio(left, right))
+
+
+def _digits(text: str) -> tuple[str, ...]:
+    return tuple(_DIGIT_RE.findall(_norm_for_match(text)))
+
+
+def _negations(text: str) -> tuple[str, ...]:
+    found = []
+    for match in _NEGATION_RE.finditer(_norm_for_match(text)):
+        token = match.group(0).replace("'", "")
+        if token in {"dont", "doesnt"}:
+            token = "not"
+        found.append(token)
+    return tuple(found)
+
+
+def near_span(quote: str, span_text: str, *, minimum: int = 90) -> bool:
+    """True when quote is the span, or rapidfuzz ≥90 with the same numbers
+    and the same negation words. A swapped day count or a dropped "not"
+    stays below this bar. No model call.
+    """
+    if not quote or not span_text:
+        return False
+    if _norm_for_match(quote) == _norm_for_match(span_text):
+        return True
+    if _digits(quote) != _digits(span_text):
+        return False
+    if _negations(quote) != _negations(span_text):
+        return False
+    return _fuzz_ratio(_norm_for_match(quote), _norm_for_match(span_text)) >= minimum
+
+
+def fragment_of_span(quote: str, span_text: str) -> bool:
+    """True when quote is a bounded piece of the span and adds no new number
+    or negation. Used to rewrite a short exact copy onto that span's id.
+    """
+    q_norm = _norm_for_match(quote)
+    s_norm = _norm_for_match(span_text)
+    if not q_norm or not s_norm:
+        return False
+    if q_norm != s_norm and not _has_bounded_span(s_norm, q_norm):
+        return False
+    if set(_digits(quote)) - set(_digits(span_text)):
+        return False
+    if set(_negations(quote)) - set(_negations(span_text)):
+        return False
+    return True
+
+
 def verify_quotes(
     quotes: list[dict[str, Any]],
     pages: dict[int, str],
@@ -72,20 +132,31 @@ def verify_quotes(
     min_chars: int | None = None,
     allowed_ids: set[str] | None = None,
     span_texts: dict[str, str] | None = None,
+    spans: list[dict[str, Any]] | None = None,
 ) -> tuple[bool, list[str]]:
-    """Accept an evidence id only when its text is that span, else an exact page span.
+    """Fail closed. An evidence id must be a member of the fetched-page span set.
 
-    The id must belong to a span built from a fetched page, and the quote text
-    must be that span. Free-text quotes still need an exact contiguous span.
+    Membership is the primary check. A string quote (no id, or id text that is
+    not the span) passes only as an exact page span or at rapidfuzz ≥90 against
+    one span on that page. This function never calls a model.
     """
     failures: list[str] = []
     if not quotes:
         return False, ["no quotes provided"]
     floor = MIN_QUOTE_CHARS if min_chars is None else max(1, int(min_chars))
     allowed = {str(i).upper() for i in allowed_ids} if allowed_ids else None
-    spans = (
+    texts = (
         {str(k).upper(): v for k, v in span_texts.items()} if span_texts else {}
     )
+    by_page: dict[int, list[str]] = {}
+    for span in spans or []:
+        try:
+            sp = int(span.get("page"))
+        except (TypeError, ValueError):
+            continue
+        piece = str(span.get("text") or "")
+        if piece:
+            by_page.setdefault(sp, []).append(piece)
 
     for q in quotes:
         text = str(q.get("text") or "").strip()
@@ -100,13 +171,42 @@ def verify_quotes(
             failures.append(f"quote page {page_i} was not fetched")
             continue
         eid = str(q.get("id") or q.get("evidence_id") or "").strip().upper()
-        if allowed is not None and eid and eid in allowed:
-            expected = spans.get(eid)
-            if expected is not None and _norm_for_match(text) == _norm_for_match(expected):
+        if eid:
+            page_mismatch = False
+            for span in spans or []:
+                if str(span.get("id") or "").upper() != eid:
+                    continue
+                try:
+                    span_page = int(span.get("page"))
+                except (TypeError, ValueError):
+                    failures.append(f"evidence id {eid} has no page")
+                    page_mismatch = True
+                    break
+                if span_page != page_i:
+                    failures.append(f"evidence id {eid} is not on page {page_i}")
+                    page_mismatch = True
+                break
+            if page_mismatch:
                 continue
-            if expected is not None:
-                failures.append(f"evidence id {eid} does not match its span text")
+            known = (allowed is not None and eid in allowed) or (
+                allowed is None and eid in texts
+            )
+            if allowed is not None and eid not in allowed:
+                failures.append(f"unknown evidence id {eid}")
                 continue
+            if known:
+                expected = texts.get(eid)
+                # Id-only citation: membership in the fetched span set.
+                # A retyped string must be that span, or rapidfuzz ≥90 against
+                # it with the same numbers and negation words.
+                if not text or (expected is not None and near_span(text, expected)):
+                    continue
+                if expected is not None:
+                    failures.append(f"evidence id {eid} does not match its span text")
+                    continue
+                failures.append(f"evidence id {eid} has no span text")
+                continue
+        # String-quote fallback. Unknown ids never reach this branch.
         if not text:
             failures.append("empty quote")
             continue
@@ -119,10 +219,15 @@ def verify_quotes(
             continue
         p_norm = _norm_for_match(source)
         if _looks_like_code_quote(text):
-            if q_norm not in p_norm:
-                failures.append(f"quote not found as contiguous span on page {page_i}")
+            if q_norm in p_norm:
+                continue
+        elif _has_bounded_span(p_norm, q_norm):
             continue
-        if not _has_bounded_span(p_norm, q_norm):
-            failures.append(f"quote not found as bounded span on page {page_i}")
+        candidates = list(by_page.get(page_i) or [])
+        if not candidates and texts:
+            candidates = list(texts.values())
+        if any(near_span(text, cand) for cand in candidates):
+            continue
+        failures.append(f"quote not found as bounded span on page {page_i}")
 
     return (len(failures) == 0, failures)

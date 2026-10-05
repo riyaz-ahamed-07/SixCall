@@ -51,15 +51,56 @@ def test_evidence_id_requires_membership_and_span_text():
     assert bad_failures
 
 
-def test_unknown_evidence_id_still_needs_exact_span():
+def test_unknown_evidence_id_is_rejected_even_when_text_is_on_page():
     pages = {1: "The refund window is fourteen days for unused items."}
     ok, failures = verify_quotes(
-        [{"id": "E99", "text": "Customers may teleport instantly", "page": 1}],
+        [{"id": "E99", "text": "refund window is fourteen days", "page": 1}],
         pages,
         allowed_ids={"E1"},
+        span_texts={"E1": "The refund window is fourteen days for unused items."},
     )
     assert ok is False
-    assert failures
+    assert any("unknown evidence id" in item for item in failures)
+
+
+def test_near_span_accepts_typo_and_rejects_number_or_negation_swap():
+    pages = {1: "The refund window is 14 days for unused items."}
+    spans = [
+        {
+            "id": "E1",
+            "page": 1,
+            "text": "The refund window is 14 days for unused items.",
+        }
+    ]
+    ok, failures = verify_quotes(
+        [{"text": "The refund window is 14 dayz for unused items.", "page": 1}],
+        pages,
+        spans=spans,
+        span_texts={"E1": spans[0]["text"]},
+    )
+    assert ok is True, failures
+    swapped, swap_failures = verify_quotes(
+        [{"text": "The refund window is 90 days for unused items.", "page": 1}],
+        pages,
+        spans=spans,
+        span_texts={"E1": spans[0]["text"]},
+    )
+    assert swapped is False
+    assert swap_failures
+    negated, neg_failures = verify_quotes(
+        [{"text": "Employees are eligible for refunds.", "page": 2}],
+        {2: "Employees are not eligible for refunds."},
+        spans=[
+            {
+                "id": "E2",
+                "page": 2,
+                "text": "Employees are not eligible for refunds.",
+            }
+        ],
+        span_texts={"E2": "Employees are not eligible for refunds."},
+    )
+    assert negated is False
+    assert neg_failures
 
 
 def test_quote_verifier_rejects_fabricated_quotes():

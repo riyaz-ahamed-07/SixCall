@@ -216,7 +216,7 @@ sequenceDiagram
 4. Local scorer (no tool): keyword IDF + heading boost. If the question is contradiction-sensitive, `max(keyword hits)` is placed first **before** heading pages are appended
 5. `get_page` for up to 3 pages, or up to 4 for multi / compare / supersede, holding one call back for repair when more candidates remain
 6. One answer call on the **main** model (Gemini, then Groq if that attempt fails)
-7. Verifier: evidence id must be one of the spans from the fetched pages; otherwise the quote must be an exact span
+7. Verifier (no extra model call): an evidence id must be one of the spans from the fetched pages. A retyped quote is kept only when it is an exact span, or rapidfuzz ≥90 against that span with the same numbers and negation words
 8. If the draft abstains or verification fails and a call remains, one repair `get_page` and one more answer call
 
 Page text is **untrusted data**. Injection-like lines are flagged; the system prompt answers the **user** question only.
@@ -452,6 +452,6 @@ pymupdf, litellm, python-dotenv, pydantic, snowballstemmer,
 nltk, pytest, fastapi, uvicorn, python-multipart, psycopg
 ```
 
-`rapidfuzz` is not used. Quote checks are evidence-ID membership or an exact span, not fuzzy match.
+`rapidfuzz` is used only as a ≥90 fallback when a quote is retyped instead of cited by evidence id. The happy path is id membership. Numbers and negation words must still match, so a swapped figure or a dropped "not" does not pass.
 
 Query planning uses NLTK `word_tokenize(..., preserve_line=True)` and English stopwords from bundled `app/nltk_data` (no runtime downloads). Technical tokens and meaning-changing words (`not`, `before`, `after`) are preserved. Include `app/nltk_data` when packaging.

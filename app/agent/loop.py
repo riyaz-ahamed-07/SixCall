@@ -345,13 +345,13 @@ def _accept_draft(
     allowed = {str(s["id"]).upper() for s in spans}
     span_texts = {str(s["id"]).upper(): str(s["text"]) for s in spans}
     ok, failures = verify_quotes(
-        quotes, pages, allowed_ids=allowed, span_texts=span_texts
+        quotes, pages, allowed_ids=allowed, span_texts=span_texts, spans=spans
     )
     if ok:
         return quotes, "", ""
     repaired = repair_quotes(quotes, pages)
     ok2, failures2 = verify_quotes(
-        repaired, pages, allowed_ids=allowed, span_texts=span_texts
+        repaired, pages, allowed_ids=allowed, span_texts=span_texts, spans=spans
     )
     if ok2:
         return repaired, "", ""

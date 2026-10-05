@@ -45,8 +45,9 @@ _WATERMARK_GLUE_RE = re.compile(
     r"(?<=[A-Za-z])(?=(?:WATERMARK|WATERMAR|WATERMA|WATERM|ATERMARK|RMARK)\b)",
     re.I,
 )
-_WATERMARK_LINE_RE = re.compile(
-    r"^(?:\s*(?:[WwAa]{1,4}|WATERM(?:ARK|A)?|ATERMARK|RMARK)\s*)+$"
+_WATERMARK_CRUMB_RE = re.compile(
+    r"^(?:[WwAa]{1,4}|WATERM(?:ARK|A)?|ATERMARK|RMARK)$",
+    re.I,
 )
 _STAMP_TOKEN_RE = re.compile(
     r"^(?:WATERMARK|WATERMAR|WATERMA|WATERM|ATERMARK|RMARK)$",
@@ -120,6 +121,17 @@ def _ocr_enabled() -> bool:
     return os.getenv("SIXCALL_OCR", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _is_watermark_crumb_line(stripped: str) -> bool:
+    """Drop a line only when every token is stamp debris and there are ≥2.
+
+    A lone ``A`` (or any single content token) is kept.
+    """
+    tokens = [t.strip(" ,.;:") for t in stripped.split() if t.strip(" ,.;:")]
+    if len(tokens) < 2:
+        return False
+    return all(_WATERMARK_CRUMB_RE.match(t) for t in tokens)
+
+
 def scrub_watermark_noise(text: str) -> str:
     """Strip stamped WATERMARK fragments without deleting ordinary words."""
     if not text:
@@ -128,7 +140,7 @@ def scrub_watermark_noise(text: str) -> str:
     kept: list[str] = []
     for ln in text.split("\n"):
         stripped = ln.strip()
-        if not stripped or _WATERMARK_LINE_RE.match(stripped):
+        if not stripped or _is_watermark_crumb_line(stripped):
             continue
         words = stripped.split()
         has_stamp = any(_STAMP_TOKEN_RE.match(w.strip(" ,.;:")) for w in words)

@@ -30,6 +30,37 @@ def test_clean_page_text_strips_watermark_fragments():
     assert "Huntrix" in cleaned
 
 
+def test_scrubber_keeps_ate_and_lone_a_line():
+    raw = "A\nThe committee ate lunch before the update.\nSection A covers dates."
+    cleaned = clean_page_text(raw)
+    assert cleaned.splitlines()[0] == "A"
+    assert "ate" in cleaned
+    assert "update" in cleaned
+    assert "Section A covers dates." in cleaned
+    stamped = clean_page_text("A W W WA\nKeep this sentence.")
+    assert "A W W WA" not in stamped
+    assert "Keep this sentence." in stamped
+
+
+def test_resolve_rejects_unknown_id_and_snaps_faithful_text():
+    pages = {1: "The refund window is fourteen days for unused items."}
+    spans = build_evidence_spans(pages)
+    by_id = {s["id"]: s for s in spans}
+    assert resolve_quote_refs([{"id": "E99", "text": "invented claim", "page": 1}], by_id) == []
+    snapped = resolve_quote_refs(
+        [{"page": 1, "text": "The refund window is fourteen dayz for unused items."}],
+        by_id,
+    )
+    assert snapped
+    assert snapped[0]["id"] == spans[0]["id"]
+    assert snapped[0]["text"] == spans[0]["text"]
+    dropped = resolve_quote_refs(
+        [{"page": 1, "text": "The refund window is 90 days for unused items."}],
+        by_id,
+    )
+    assert dropped == []
+
+
 def test_scrubber_keeps_real_tokens():
     raw = (
         "The committee ate lunch and will update the late schedule. "

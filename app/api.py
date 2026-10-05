@@ -98,18 +98,24 @@ def ask(
       else → budgeted tree+keyword agent
     """
     hist = list(history or [])
-    # Live /ask does not answer from memory unless the flag is explicitly on.
+    # Live /ask does not answer from memory unless the flag is explicitly on,
+    # and it never returns a result that used zero tools.
+    routed_via_agent = False
     if (
         _followups_enabled()
         and is_followup_question(question, hist)
         and not prior_answer_was_insufficient(hist)
     ):
         result = run_followup(doc_id, question, hist)
-        if result.get("status") != "ok":
+        if result.get("status") != "ok" or int(result.get("calls_used") or 0) <= 0:
             result = run_agent(doc_id, question)
+            routed_via_agent = True
     elif is_overview_question(question):
         result = run_overview(doc_id, question)
     else:
+        result = run_agent(doc_id, question)
+        routed_via_agent = True
+    if not routed_via_agent and int(result.get("calls_used") or 0) <= 0:
         result = run_agent(doc_id, question)
     answer = _to_answer(result)
     _persist_answer(doc_id, question, answer, owner_id=owner_id)
