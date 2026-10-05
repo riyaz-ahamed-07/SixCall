@@ -75,14 +75,14 @@ def test_supersede_forces_latest_keyword_hit_into_pages_used(tmp_path, monkeypat
 
 def test_repair_get_page_when_draft_abstains_and_budget_remains(tmp_path, monkeypatch):
     clear_active_session()
-    pages = {i: f"Filler page {i}." for i in range(1, 10)}
-    pages[1] = "Alpha section opens with background only."
-    pages[2] = "Alpha section continues with background only."
-    pages[9] = "Alpha result. The refund window is 14 days."
+    quote = "The refund window is 14 days."
+    pages = {
+        i: f"Alpha section page {i} background. {quote}" for i in range(1, 10)
+    }
     doc_id = _seed(
         tmp_path,
         pages,
-        [Heading(title="Alpha section", level=1, start=1, end=2)],
+        [Heading(title="Alpha section", level=1, start=1, end=5)],
     )
     monkeypatch.setattr(
         "app.agent.loop.plan_question",
@@ -97,30 +97,34 @@ def test_repair_get_page_when_draft_abstains_and_budget_remains(tmp_path, monkey
             "coding": False,
         },
     )
-    calls = {"n": 0}
+    calls = {"n": 0, "first": set()}
 
     def _draft(**kwargs):
         calls["n"] += 1
-        got = kwargs["pages"]
+        got = set(kwargs["pages"])
+        assert kwargs["budget_left"] >= 0
         if calls["n"] == 1:
-            assert 9 not in got
+            calls["first"] = set(got)
+            assert kwargs["budget_left"] >= 1
             return {
                 "status": "insufficient_information",
                 "answer": "The excerpts do not state the window.",
                 "quotes": [],
             }
-        assert 9 in got
+        added = got - calls["first"]
+        assert len(added) == 1
+        page = next(iter(added))
         return {
             "status": "ok",
-            "answer": "The refund window is 14 days.",
-            "quotes": [{"text": "The refund window is 14 days.", "page": 9}],
+            "answer": quote,
+            "quotes": [{"text": quote, "page": page}],
         }
 
     monkeypatch.setattr("app.agent.loop.draft_answer", _draft)
     result = run_agent(doc_id, "Where is alpha?")
     assert result["status"] == "ok"
-    assert 9 in result["pages_used"]
     assert calls["n"] == 2
+    assert len(calls["first"]) >= 3
     assert result["calls_used"] <= 6
     assert result["calls_used"] >= 1
     clear_active_session()
@@ -145,3 +149,30 @@ def test_ocr_is_off_by_default(tmp_path, monkeypatch):
     store = DocumentStore(tmp_path / "store", use_db=False)
     doc_id = store.ingest_pdf(pdf, source_name="sparse.pdf")
     assert store.get(doc_id) is not None
+
+
+def test_multi_compare_can_fetch_three_and_budget_is_not_idle():
+    from app.agent.loop import _apply_heading_boost, select_initial_pages
+
+    wide = select_initial_pages(list(range(1, 9)), 4, wide=True)
+    assert len(wide) == 3
+    plain = select_initial_pages(list(range(1, 9)), 4, wide=False)
+    assert len(plain) == 3
+    # One search leaves four calls: supersede may read four and still hold none
+    # only when every candidate fits. With extras, one call stays for repair.
+    held = select_initial_pages(list(range(1, 9)), 5, wide=True)
+    assert len(held) == 4
+    assert 5 - len(held) == 1
+
+    for is_wide in (False, True):
+        for budget in range(1, 6):
+            for count in range(1, 9):
+                ranked = list(range(1, count + 1))
+                chosen = select_initial_pages(ranked, budget, wide=is_wide)
+                unread = count - len(chosen)
+                if unread:
+                    assert budget - len(chosen) <= 1
+                assert len(chosen) <= 4
+
+    boosted = _apply_heading_boost([40, 2, 3, 6, 8], [7, 11], latest=40, window=3)
+    assert 40 in boosted[:3]

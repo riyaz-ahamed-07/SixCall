@@ -71,17 +71,21 @@ def verify_quotes(
     *,
     min_chars: int | None = None,
     allowed_ids: set[str] | None = None,
+    span_texts: dict[str, str] | None = None,
 ) -> tuple[bool, list[str]]:
-    """Accept evidence IDs from fetched pages, else an exact span of page text.
+    """Accept an evidence id only when its text is that span, else an exact page span.
 
-    ID membership is the citation contract: the id must come from spans built
-    for these pages. Free-text quotes still need an exact contiguous span.
+    The id must belong to a span built from a fetched page, and the quote text
+    must be that span. Free-text quotes still need an exact contiguous span.
     """
     failures: list[str] = []
     if not quotes:
         return False, ["no quotes provided"]
     floor = MIN_QUOTE_CHARS if min_chars is None else max(1, int(min_chars))
     allowed = {str(i).upper() for i in allowed_ids} if allowed_ids else None
+    spans = (
+        {str(k).upper(): v for k, v in span_texts.items()} if span_texts else {}
+    )
 
     for q in quotes:
         text = str(q.get("text") or "").strip()
@@ -97,7 +101,12 @@ def verify_quotes(
             continue
         eid = str(q.get("id") or q.get("evidence_id") or "").strip().upper()
         if allowed is not None and eid and eid in allowed:
-            continue
+            expected = spans.get(eid)
+            if expected is not None and _norm_for_match(text) == _norm_for_match(expected):
+                continue
+            if expected is not None:
+                failures.append(f"evidence id {eid} does not match its span text")
+                continue
         if not text:
             failures.append("empty quote")
             continue

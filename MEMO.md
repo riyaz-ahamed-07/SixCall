@@ -5,8 +5,8 @@
 ## Architecture
 
 1. **Ingest** — PyMuPDF extracts immutable page text, TOC/font headings, and a stemmed inverted index. `doc_id` is `sha256(owner:bytes)[:16]` so tenants isolate identical files.
-2. **Route** — Only a pure clarification ("why?", "explain that more simply") may answer from prior quotes, and those quotes must match the previous turn. Any other question uses tools. Whole-document overview asks sample ≤5 pages. Everything else runs the tree∩keyword agent.
-3. **Agent** — A local planner picks keywords. Tools run under a `ContextVar` budget. Contradiction-sensitive questions force the latest keyword hit into the pages actually read, before heading boost, and may read up to 3 pages. The answer cites evidence ids from those pages. If it abstains and budget remains, one repair `get_page` is allowed.
+2. **Route** — Live asks use tools. A pure clarification can reuse prior quotes only when `SIXCALL_FOLLOWUPS=1`. Whole-document overview reads real pages (`get_page`). The light TOC summary is post-ingest only and is not served from `/ask`.
+3. **Agent** — A local planner picks keywords (optional LLM planner is off). Budget: `1×list_headings + ≤2×search_keyword + ≤3–4×get_page ≤ 6`. Superseding questions force the latest keyword hit into the fetch window before heading boost. Multi/compare/supersede may read 4 pages; everything else reads 3, holding one call for a single repair re-draft. Evidence ids are capped per page.
 4. **Fail closed** — Empty/unverified answers become `insufficient_information`. Request + DB statement timeouts bound hang risk.
 
 ## Why this shape

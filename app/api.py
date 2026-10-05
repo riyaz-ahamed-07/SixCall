@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -73,6 +74,16 @@ def _persist_answer(
         logging.getLogger(__name__).warning("answer_db_persist_failed qid=%s error=%s", answer.question_id, type(exc).__name__)
 
 
+def _followups_enabled() -> bool:
+    """Zero-tool follow-ups are off unless SIXCALL_FOLLOWUPS=1."""
+    return os.getenv("SIXCALL_FOLLOWUPS", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def ask(
     doc_id: str,
     question: str,
@@ -82,14 +93,18 @@ def ask(
 ) -> Answer:
     """
     Route:
-      pure clarification of the previous answer → prior quotes only (else tools)
-      overview phrasing → overview path
+      SIXCALL_FOLLOWUPS=1 and a pure clarification → prior quotes, else tools
+      overview phrasing → real get_page overview (never the light TOC summary)
       else → budgeted tree+keyword agent
     """
     hist = list(history or [])
-    if is_followup_question(question, hist) and not prior_answer_was_insufficient(hist):
+    # Live /ask does not answer from memory unless the flag is explicitly on.
+    if (
+        _followups_enabled()
+        and is_followup_question(question, hist)
+        and not prior_answer_was_insufficient(hist)
+    ):
         result = run_followup(doc_id, question, hist)
-        # If memory alone can't answer, reopen the document with tools.
         if result.get("status") != "ok":
             result = run_agent(doc_id, question)
     elif is_overview_question(question):

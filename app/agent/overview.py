@@ -271,7 +271,8 @@ def run_light_summary(doc_id: str) -> dict[str, Any]:
         if not real:
             return _insufficient("no headings available", status_reason="no_evidence")
 
-        # Synthetic page bodies so heading titles can be verified as exact quotes.
+        # Post-ingest UX only (POST /overview light=true). /ask never calls this.
+        # Heading titles are checked as quotes; this is not a user-question answer.
         pages: dict[int, str] = {}
         lines: list[str] = []
         for i, h in enumerate(real, start=1):
@@ -474,7 +475,7 @@ def run_overview(doc_id: str, question: str | None = None) -> dict[str, Any]:
             plan=plan,
             pages=fetched,
             unused_candidates=[],
-            budget_left=0,
+            budget_left=session.budget_left,
         )
 
         if draft["status"] != "ok":

@@ -116,10 +116,19 @@ def score_pages(
             break
 
     if contradiction_sensitive and hit_sets:
-        # Latest keyword hit wins the first slot. Heading scores must not bury it.
+        # Later statement supersedes earlier: keep max(keyword hits) inside top-k.
+        # If the window is full, drop the lowest-scoring page that is not that hit.
         latest_kw = max(p for pageset in hit_sets.values() for p in pageset)
-        rest = [p for p in chosen if p != latest_kw]
-        chosen = [latest_kw, *rest]
+        if latest_kw not in chosen:
+            if len(chosen) >= top_k:
+                victim = min(
+                    (p for p in chosen if p != latest_kw),
+                    key=lambda p: (scores.get(p, 0.0), p),
+                )
+                chosen = [p for p in chosen if p != victim]
+            chosen = [latest_kw, *chosen]
+        else:
+            chosen = [latest_kw, *[p for p in chosen if p != latest_kw]]
 
     return chosen[:top_k]
 

@@ -105,6 +105,61 @@ def test_ask_normal_question_uses_tools(monkeypatch):
     assert answer.pages_used == [4]
 
 
+def test_ask_followups_and_light_summary_are_off(monkeypatch):
+    from app.api import ask
+
+    monkeypatch.delenv("SIXCALL_FOLLOWUPS", raising=False)
+
+    def _followup(*args, **kwargs):
+        raise AssertionError("follow-ups are off unless SIXCALL_FOLLOWUPS=1")
+
+    def _light(*args, **kwargs):
+        raise AssertionError("light summary is not an /ask answer")
+
+    def _agent(doc_id, question):
+        return {
+            "text": "The refund window is 14 days.",
+            "status": "ok",
+            "pages_used": [2],
+            "tool_trace": [{"tool": "get_page", "call_index": 2}],
+            "calls_used": 3,
+            "question_id": "q-live",
+            "quotes": [{"page": 2, "text": "The refund window is 14 days."}],
+        }
+
+    def _overview(doc_id, question):
+        return {
+            "text": "This document is a refund policy.",
+            "status": "ok",
+            "pages_used": [1],
+            "tool_trace": [{"tool": "get_page", "call_index": 2}],
+            "calls_used": 2,
+            "question_id": "q-over",
+            "quotes": [{"page": 1, "text": "Refund policy overview."}],
+        }
+
+    monkeypatch.setattr("app.api.run_followup", _followup)
+    monkeypatch.setattr("app.api.run_light_summary", _light)
+    monkeypatch.setattr("app.api.run_agent", _agent)
+    monkeypatch.setattr("app.api.run_overview", _overview)
+    monkeypatch.setattr("app.api._persist_answer", lambda *a, **k: None)
+    history = [
+        {"role": "user", "text": "What is the refund window?"},
+        {
+            "role": "assistant",
+            "text": "The refund window is 14 days.",
+            "status": "ok",
+            "quotes": [{"page": 1, "text": "The refund window is 14 days."}],
+        },
+    ]
+    live = ask("doc", "why?", history=history)
+    assert live.calls_used > 0
+    assert live.tool_trace
+    overview = ask("doc", "What is this document about?")
+    assert overview.calls_used > 0
+    assert overview.pages_used == [1]
+
+
 def test_new_lookup_not_treated_as_followup():
     history = [
         {"role": "user", "text": "What is A*?"},

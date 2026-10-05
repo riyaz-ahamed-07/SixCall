@@ -7,9 +7,9 @@ _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 _MAX_QUOTE_WORDS = 45
 _MAX_CODE_QUOTE_WORDS = 120
 _MIN_SPAN_CHARS = 8
-# Per page, so a long early page cannot consume the whole evidence list.
-_MAX_SPANS_PER_PAGE = 12
-_MAX_SPANS = 36
+# Per page, so a long early page cannot fill the list and starve an amendment.
+_MAX_SPANS_PER_PAGE = 8
+_MAX_SPANS = 32
 _SHORT_QUOTE_WORDS = 18
 
 _CODE_LINE_RE = re.compile(
@@ -118,6 +118,10 @@ def extend_quotes(
             continue
         source = pages.get(page) or ""
         if not text or not source:
+            out.append(q)
+            continue
+        # Evidence-id quotes stay the exact span the id names.
+        if q.get("id"):
             out.append(q)
             continue
         words = text.split()

@@ -20,40 +20,58 @@ from app.tools.wrapper import (
 )
 
 _BROAD_HIT_CAP = 20
-# Keep enough budget for evidence reads after search.
-_MIN_PAGE_RESERVE = 1
-_MIN_PAGE_RESERVE_BROAD = 3
-# Simple facts stay at 2 pages. Multi / compare / contradiction / howto use 3.
-_MAX_PAGES_FETCH = 2
-_MAX_PAGES_FETCH_BROAD = 3
-_MAX_SEARCHES_CODING = 2
+# Stop searching once this many calls remain so pages, not extra keywords, get them.
+_PAGE_FLOOR = 3
+_MAX_SEARCHES = 2
+# Default read window, and the wider window for multi / compare / supersede.
+_MAX_PAGES = 3
+_MAX_PAGES_WIDE = 4
 
 
-def _broad_read(plan: dict[str, Any]) -> bool:
-    return bool(
-        plan.get("contradiction_sensitive")
-        or plan.get("coding")
-        or plan.get("intent") in {"howto", "multi", "compare"}
-    )
+def _wide_read(plan: dict[str, Any], question: str = "") -> bool:
+    """Multi/compare, or a question where a later statement can supersede an earlier one."""
+    if plan.get("contradiction_sensitive") or plan.get("intent") in {"multi", "compare"}:
+        return True
+    blob = f"{question} {plan.get('rewritten') or ''}".lower()
+    return any(k in blob for k in ("amend", "supersed"))
 
 
-def _pages_fetch_cap(plan: dict[str, Any]) -> int:
-    if _broad_read(plan):
-        return _MAX_PAGES_FETCH_BROAD
-    return _MAX_PAGES_FETCH
+def select_initial_pages(
+    ranked: list[int], budget_left: int, *, wide: bool
+) -> list[int]:
+    """Pages to read before the first answer.
 
-
-def _page_reserve(plan: dict[str, Any]) -> int:
-    if _broad_read(plan):
-        return _MIN_PAGE_RESERVE_BROAD
-    return _MIN_PAGE_RESERVE
+    Default window is min(budget, 3). Multi/compare/supersede may use min(budget, 4).
+    If candidates would remain and the last call would be spent, hold exactly one
+    call for a repair get_page. Do not leave more than that one call idle.
+    """
+    if budget_left <= 0 or not ranked:
+        return []
+    limit = _MAX_PAGES_WIDE if wide else _MAX_PAGES
+    slots = min(budget_left, limit, len(ranked))
+    if len(ranked) > slots and budget_left - slots > 1:
+        slots = min(len(ranked), budget_left - 1, _MAX_PAGES_WIDE)
+    if (
+        budget_left >= 2
+        and len(ranked) > slots
+        and budget_left - slots == 0
+        and slots > 1
+    ):
+        slots -= 1
+    return ranked[:slots]
 
 
 def run_agent(doc_id: str, question: str) -> dict[str, Any]:
     """
-    Tree + keyword agent (budgeted):
+    Tree + keyword agent.
 
-      list_headings → plan → search_keyword → score → get_page(s) → ONE answer → verify
+    Budget math (the wrapper hard-stops the 7th call):
+      1×list_headings + ≤2×search_keyword + ≤3–4×get_page ≤ 6
+
+    Repair exists so a failed draft can spend one held-back get_page and
+    re-draft once (two answer generations total, never a third).
+    Follow-ups are off by default (SIXCALL_FOLLOWUPS=0): a live /ask must
+    use these budgeted tools instead of answering from chat memory alone.
     """
     question_id = uuid.uuid4().hex[:12]
     start_deadline(REQUEST_DEADLINE_SEC)
@@ -109,19 +127,14 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
 
         # Preserve planner keyword order (most distinctive first).
         keywords = [str(k).strip() for k in (plan.get("keywords") or []) if str(k).strip()]
-        page_reserve = _page_reserve(plan)
-        max_searches = (
-            _MAX_SEARCHES_CODING
-            if plan.get("coding") or plan.get("intent") == "howto"
-            else len(keywords)
-        )
+        wide = _wide_read(plan, question)
 
         keyword_hits: dict[str, list[int]] = {}
         for i, kw in enumerate(keywords):
-            if i >= max_searches:
+            if i >= _MAX_SEARCHES:
                 break
-            # Reserve slots for page reads before spending on another search.
-            if session.budget_left <= page_reserve and keyword_hits:
+            # 1 heading + ≤2 searches, then the rest of the budget is for pages.
+            if keyword_hits and session.budget_left <= _PAGE_FLOOR:
                 break
             if session.budget_left < 1:
                 break
@@ -150,9 +163,9 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
             else:
                 keyword_hits[kw] = pages
 
-        if not any(keyword_hits.values()) and session.budget_left > page_reserve:
+        if not any(keyword_hits.values()) and session.budget_left > _PAGE_FLOOR:
             for hint in plan.get("heading_hints") or []:
-                if session.budget_left <= page_reserve:
+                if session.budget_left <= _PAGE_FLOOR:
                     break
                 rescue = str(hint).strip()
                 if len(rescue) < 3:
@@ -191,26 +204,28 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
                 ranked = _ensure_coverage(ranked, keyword_hits, top_k)
             strategy = "tree+keyword"
 
-        # Latest keyword hit must occupy a fetch slot before heading pages are added.
-        if plan.get("contradiction_sensitive"):
-            ranked = _force_latest_keyword_page(ranked, keyword_hits)
+        # Later statement supersedes earlier: lock max(keyword hits) in
+        # before heading/tree boost can reorder the fetch window.
+        latest_hit = _latest_keyword_page(keyword_hits) if _supersede(plan, question) else None
+        if latest_hit is not None:
+            ranked = [latest_hit, *[p for p in ranked if p != latest_hit]]
 
-        # Outline section starts — append after keyword ranks so rare hits (e.g. CSV) win.
         tree_boost = _heading_start_pages(headings, plan.get("heading_hints") or [])
+        preview = select_initial_pages(ranked, session.budget_left, wide=wide)
         if tree_boost:
-            ranked = list(dict.fromkeys([*ranked, *tree_boost]))[
-                : max(1, session.budget_left)
-            ]
+            ranked = _apply_heading_boost(
+                ranked,
+                tree_boost,
+                latest=latest_hit,
+                window=max(1, len(preview) or 1),
+            )
 
         if not ranked:
             return _insufficient("no candidate pages", status_reason="no_evidence")
 
-        fetch_cap = min(session.budget_left, _pages_fetch_cap(plan))
-        to_fetch = _expand_neighbor_pages(
-            ranked[:fetch_cap],
-            ranked,
-            max_total=fetch_cap,
-        )
+        # Recompute after the boost so a newly inserted heading page can be read,
+        # while the latest keyword hit stays inside the window.
+        to_fetch = select_initial_pages(ranked, session.budget_left, wide=wide)
         for page_no in to_fetch:
             if session.budget_left < 1:
                 break
@@ -231,29 +246,39 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
         if not fetched:
             return _insufficient("no pages fetched", status_reason="no_evidence")
 
+        # Real remaining budget — not a hardcoded 0 — so the answerer can see
+        # that one repair read may still be available.
+        answer_calls = 0
         draft = _generate(question, plan, fetched, ranked, session.budget_left)
+        answer_calls += 1
         quotes, detail, reason_code = _accept_draft(draft, fetched)
-        if quotes is None and session.budget_left >= 1:
-            repair_page = _pick_repair_page(fetched, keyword_hits, ranked)
-            if repair_page is not None:
-                try:
-                    text = get_page(doc_id, repair_page)
-                except BudgetExceededError:
-                    return _insufficient(
-                        "budget exceeded during repair get_page",
-                        status_reason="budget_exhausted",
-                    )
-                except Exception as exc:
-                    return _insufficient(
-                        f"get_page failed: {type(exc).__name__}",
-                        status_reason="unreadable_document",
-                    )
-                fetched[repair_page] = text
-                pages_used.append(repair_page)
-                draft = _generate(
-                    question, plan, fetched, ranked, session.budget_left
+        unused = [p for p in ranked if p not in fetched]
+        if (
+            quotes is None
+            and answer_calls < 2
+            and session.budget_left >= 1
+            and unused
+        ):
+            repair_page = unused[0]
+            try:
+                text = get_page(doc_id, repair_page)
+            except BudgetExceededError:
+                return _insufficient(
+                    "budget exceeded during repair get_page",
+                    status_reason="budget_exhausted",
                 )
-                quotes, detail, reason_code = _accept_draft(draft, fetched)
+            except Exception as exc:
+                return _insufficient(
+                    f"get_page failed: {type(exc).__name__}",
+                    status_reason="unreadable_document",
+                )
+            fetched[repair_page] = text
+            pages_used.append(repair_page)
+            draft = _generate(
+                question, plan, fetched, ranked, session.budget_left
+            )
+            answer_calls += 1
+            quotes, detail, reason_code = _accept_draft(draft, fetched)
 
         if quotes is None:
             return _insufficient(detail or "model declined", status_reason=reason_code)
@@ -316,45 +341,67 @@ def _accept_draft(
     from app.agent.evidence import build_evidence_spans, repair_quotes
 
     quotes = list(draft.get("quotes") or [])
-    allowed = {str(s["id"]).upper() for s in build_evidence_spans(pages)}
-    ok, failures = verify_quotes(quotes, pages, allowed_ids=allowed)
+    spans = build_evidence_spans(pages)
+    allowed = {str(s["id"]).upper() for s in spans}
+    span_texts = {str(s["id"]).upper(): str(s["text"]) for s in spans}
+    ok, failures = verify_quotes(
+        quotes, pages, allowed_ids=allowed, span_texts=span_texts
+    )
     if ok:
         return quotes, "", ""
     repaired = repair_quotes(quotes, pages)
-    ok2, failures2 = verify_quotes(repaired, pages, allowed_ids=allowed)
+    ok2, failures2 = verify_quotes(
+        repaired, pages, allowed_ids=allowed, span_texts=span_texts
+    )
     if ok2:
         return repaired, "", ""
     detail = "quote verification failed: " + "; ".join((failures2 or failures)[:3])
     return None, detail, "invalid_output"
 
 
-def _force_latest_keyword_page(
-    ranked: list[int], keyword_hits: dict[str, list[int]]
-) -> list[int]:
-    """Put max(keyword hit pages) first, before any heading-page append."""
+def _supersede(plan: dict[str, Any], question: str) -> bool:
+    if plan.get("contradiction_sensitive"):
+        return True
+    blob = f"{question} {plan.get('rewritten') or ''}".lower()
+    return any(k in blob for k in ("amend", "supersed"))
+
+
+def _latest_keyword_page(keyword_hits: dict[str, list[int]]) -> int | None:
     pages = [int(p) for hits in keyword_hits.values() for p in hits]
-    if not pages:
-        return ranked
-    latest = max(pages)
-    return [latest, *[p for p in ranked if p != latest]]
+    return max(pages) if pages else None
 
 
-def _pick_repair_page(
-    fetched: dict[int, str],
-    keyword_hits: dict[str, list[int]],
+def _apply_heading_boost(
     ranked: list[int],
-) -> int | None:
-    """One extra page when the draft abstains or quotes fail and budget remains."""
-    have = set(fetched)
-    kw_pages = [int(p) for hits in keyword_hits.values() for p in hits]
-    if kw_pages:
-        latest = max(kw_pages)
-        if latest not in have:
-            return latest
-    for page in ranked:
-        if page not in have:
-            return page
-    return None
+    boost: list[int],
+    *,
+    latest: int | None,
+    window: int,
+) -> list[int]:
+    """Insert heading starts into the fetch window without dropping `latest`.
+
+    If the window is full, the lowest-priority non-latest page is replaced.
+    """
+    front = list(ranked[:window])
+    rest = list(ranked[window:])
+    for page in boost:
+        if page in front:
+            continue
+        if len(front) < window:
+            front.append(page)
+            rest = [p for p in rest if p != page]
+            continue
+        victim = next((i for i in range(len(front) - 1, -1, -1) if front[i] != latest), None)
+        if victim is None:
+            if page not in rest:
+                rest.append(page)
+            continue
+        displaced = front.pop(victim)
+        front.append(page)
+        rest = [p for p in rest if p != page]
+        if displaced not in front and displaced not in rest:
+            rest.append(displaced)
+    return list(dict.fromkeys([*front, *rest]))
 
 
 def _ensure_coverage(
@@ -374,27 +421,6 @@ def _ensure_coverage(
             else:
                 chosen.append(pick)
     return chosen[:top_k]
-
-
-def _expand_neighbor_pages(
-    chosen: list[int],
-    pool: list[int],
-    *,
-    max_total: int,
-) -> list[int]:
-    """Pull adjacent pages from the ranked pool (code/samples often span page breaks)."""
-    if max_total < 1 or not chosen:
-        return chosen[:max_total]
-    pool_set = set(pool)
-    out = list(chosen)
-    for p in chosen:
-        if len(out) >= max_total:
-            break
-        for n in (p + 1, p - 1):
-            if n in pool_set and n not in out:
-                out.append(n)
-                break
-    return out[:max_total]
 
 
 def _heading_start_pages(

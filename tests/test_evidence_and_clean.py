@@ -71,7 +71,8 @@ def test_later_page_is_not_starved_by_early_spans():
     spans = build_evidence_spans(pages)
     assert any(s["page"] == 2 and "supersedes" in s["text"] for s in spans)
     page1_count = sum(1 for s in spans if s["page"] == 1)
-    assert page1_count <= 12
+    assert 0 < page1_count <= 8
+    assert any(s["page"] == 2 for s in spans)
 
 
 def test_evidence_ids_resolve_to_exact_verifiable_spans():

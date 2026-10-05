@@ -174,7 +174,7 @@ At ingest we build a **keyword inverted map** (`stem → sorted page numbers`) s
 
 ## Agent loop
 
-Per-question flow (budgeted). The planner is local unless `SIXCALL_LLM_PLANNER=1`, so a normal question is one answer-model call. Only a pure clarification of the previous answer ("why?", "explain that more simply") may skip tools, and only when it recopies a prior quote.
+Per-question flow (budgeted). Planning is local unless `SIXCALL_LLM_PLANNER=1`, so the happy path is one answer-model call (two if that flag is on). A repair re-draft is the only extra answer call. Follow-ups that skip tools are off unless `SIXCALL_FOLLOWUPS=1`.
 
 ```mermaid
 sequenceDiagram
@@ -214,7 +214,7 @@ sequenceDiagram
 2. Local planner (no network): keywords, intent, contradiction flag
 3. `search_keyword` ×1–2
 4. Local scorer (no tool): keyword IDF + heading boost. If the question is contradiction-sensitive, `max(keyword hits)` is placed first **before** heading pages are appended
-5. `get_page` for up to 2 pages, or up to 3 for multi / compare / contradiction / howto
+5. `get_page` for up to 3 pages, or up to 4 for multi / compare / supersede, holding one call back for repair when more candidates remain
 6. One answer call on the **main** model (Gemini, then Groq if that attempt fails)
 7. Verifier: evidence id must be one of the spans from the fetched pages; otherwise the quote must be an exact span
 8. If the draft abstains or verification fails and a call remains, one repair `get_page` and one more answer call

@@ -26,15 +26,29 @@ def test_quote_verifier_accepts_exact_span():
     assert failures == []
 
 
-def test_evidence_id_membership_accepts_known_id():
+def test_evidence_id_requires_membership_and_span_text():
+    from app.agent.evidence import build_evidence_spans
+
     pages = {1: "The refund window is fourteen days for unused items."}
+    spans = build_evidence_spans(pages)
+    span = spans[0]
+    span_texts = {span["id"]: span["text"]}
     ok, failures = verify_quotes(
-        [{"id": "E1", "text": "not the page text at all", "page": 1}],
+        [{"id": span["id"], "text": span["text"], "page": span["page"]}],
         pages,
-        allowed_ids={"E1"},
+        allowed_ids={span["id"]},
+        span_texts=span_texts,
     )
     assert ok is True
     assert failures == []
+    bad, bad_failures = verify_quotes(
+        [{"id": span["id"], "text": "not the page text at all", "page": span["page"]}],
+        pages,
+        allowed_ids={span["id"]},
+        span_texts=span_texts,
+    )
+    assert bad is False
+    assert bad_failures
 
 
 def test_unknown_evidence_id_still_needs_exact_span():
