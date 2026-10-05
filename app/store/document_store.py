@@ -825,7 +825,9 @@ class DocumentStore:
             if hit:
                 precise.update(int(p) for p in hit)
         if precise:
+            # Precision named pages. Do not union the stemmed map onto them.
             return sorted(precise)
+        # Recall is a soft fill only when precision names no pages.
         hits: set[int] = set()
         for alias in aliases:
             for page in _lookup_single(rec, alias):

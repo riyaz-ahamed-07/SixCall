@@ -225,7 +225,7 @@ CLI / UI / HTTP ──► Agent ──► wrapper (max 6) ──► 4 tools
             <div className="mt-4 grid gap-3">
               <Card
                 title="Ask (default)"
-                body="list_headings → planner keywords → search_keyword → local tree∩keyword score → get_page ×N → one answer → exact quote verify."
+                body="list_headings → question-only pins → search_keyword → local section match → get_page ×N → one answer → exact quote verify. A strong heading match skips the planner."
               />
               <Card
                 title="Overview"

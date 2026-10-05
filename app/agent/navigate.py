@@ -32,27 +32,54 @@ def _title_tokens(title: str) -> set[str]:
     return {t.lower() for t in content_words(cleaned)}
 
 
-def match_sections(question: str, headings: list[dict[str, Any]]) -> SectionMatch:
-    """Token overlap between the question and heading titles."""
+def _phrase_in_title(phrase: str, title: str, title_tokens: set[str]) -> bool:
+    phrase = (phrase or "").strip().lower()
+    if not phrase:
+        return False
+    if " " in phrase:
+        return phrase in (title or "").lower()
+    return phrase in title_tokens
+
+
+def match_sections(
+    question: str,
+    headings: list[dict[str, Any]],
+    entities: list[str] | None = None,
+) -> SectionMatch:
+    """Score heading titles by token and phrase overlap. No embeddings.
+
+    A title matches when half its content words are in the question, at least
+    two content words overlap, or an extracted question phrase sits in the
+    title. At most three ranges are kept.
+    """
     q_tokens = {t.lower() for t in content_words(question)}
-    scored: list[tuple[float, int, dict[str, Any]]] = []
+    phrases = [str(item).strip() for item in (entities or []) if str(item).strip()]
+    scored: list[tuple[float, int, int, dict[str, Any]]] = []
     for heading in headings or []:
         title = str(heading.get("title") or "").strip()
         if not title or _SYNTHETIC_RE.match(title):
             continue
         t_tokens = _title_tokens(title)
-        if not t_tokens or not q_tokens:
+        if not t_tokens and not phrases:
             continue
         overlap = q_tokens & t_tokens
-        if not overlap:
+        phrase_hits = sum(1 for phrase in phrases if _phrase_in_title(phrase, title, t_tokens))
+        if not overlap and not phrase_hits:
             continue
-        ratio = len(overlap) / len(t_tokens)
-        scored.append((ratio, len(overlap), heading))
+        ratio = (len(overlap) / len(t_tokens)) if t_tokens else 0.0
+        if ratio < 0.5 and len(overlap) < 2 and phrase_hits == 0:
+            continue
+        scored.append((ratio, len(overlap), phrase_hits, heading))
 
-    scored.sort(key=lambda item: (-item[0], -item[1], str(item[2].get("title") or "")))
-    # A title is a real hit when half its content words are in the question,
-    # or at least two content words overlap.
-    kept = [h for ratio, count, h in scored if ratio >= 0.5 or count >= 2]
+    scored.sort(
+        key=lambda item: (
+            -item[0],
+            -item[1],
+            -item[2],
+            str(item[3].get("title") or ""),
+        )
+    )
+    kept = [heading for _ratio, _count, _phrases, heading in scored[:3]]
     strong = bool(kept)
     ranges: list[tuple[int, int]] = []
     starts: list[int] = []
@@ -122,6 +149,30 @@ def choose_pages(
         ranked = head
 
     return ranked
+
+
+def apply_supersede_lock(fetch: list[int], latest: int | None) -> list[int]:
+    """Force the newest keyword hit into the pages that will be read.
+
+    Later statement supersedes earlier. A section filter must not drop that
+    page. When the window is full, drop the lowest-priority non-latest page
+    so the repair slot is not stolen.
+    """
+    pages = [int(p) for p in fetch]
+    if latest is None:
+        return pages
+    latest = int(latest)
+    if latest in pages:
+        return pages
+    if not pages:
+        return [latest]
+    # Later statement supersedes earlier.
+    return [*pages[:-1], latest]
+
+
+def optional_search_keeps_repair(budget_left: int) -> bool:
+    """True when one more search still leaves a page read and a repair slot."""
+    return budget_left >= 3
 
 
 def _cover(

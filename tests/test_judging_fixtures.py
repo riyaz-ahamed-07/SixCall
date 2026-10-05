@@ -153,6 +153,7 @@ def test_fixture_absent_question_abstains_with_real_tool_calls(tmp_path, monkeyp
 
     monkeypatch.setattr("app.agent.answerer.get_llm", lambda: _NoModel())
     monkeypatch.setattr("app.agent.planner.get_llm", lambda: _NoModel())
+    monkeypatch.setattr("app.agent.toc_pick.get_llm", lambda: _NoModel())
     result = run_agent(
         doc_id,
         "What is the teleportation warranty for lunar freight?",

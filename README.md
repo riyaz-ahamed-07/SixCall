@@ -174,7 +174,7 @@ The ceiling is a **budget ledger** (six calls, logged, seventh refused). Navigat
 
 ## Agent loop
 
-Happy path: **no planner model call**. One answer call after the tools. A planner call is used only when heading-title overlap is weak and a question pin already hit a page (at most once). A failed draft may spend one held `get_page` and one more answer. New questions do not answer with zero tools (`SIXCALL_FOLLOWUPS` defaults off).
+Happy path: **no planner model call**. One answer call after the tools. A weak outline may spend one TOC pick, and only to choose existing heading titles plus terms already in the question. A failed draft may spend one held `get_page` and one more answer. New questions do not answer with zero tools (`SIXCALL_FOLLOWUPS` defaults off).
 
 ```mermaid
 sequenceDiagram

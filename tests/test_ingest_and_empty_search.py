@@ -36,15 +36,10 @@ def test_empty_search_returns_insufficient_information(tmp_path: Path):
     _make_pdf(pdf, "Only zebra appears here.")
     doc_id = ingest_pdf(str(pdf))
 
-    with patch("app.agent.loop.plan_question") as plan:
+    with patch("app.agent.loop.pick_toc") as plan:
         plan.return_value = {
-            "rewritten": "missing term",
-            "qtype": "fact",
-            "keywords": ["xylophone-not-present"],
-            "heading_hints": [],
-            "contradiction_sensitive": False,
-            "intent": "fact",
-            "format_card": "FORMAT=fact: answer briefly.",
+            "sections": [],
+            "use_terms": ["xylophone-not-present"],
         }
         answer = ask(doc_id, "Where is xylophone?")
 

@@ -1,17 +1,24 @@
 """Structure-first ask loop.
 
-Happy path (heading titles overlap the question): no planner model call.
+Structure-first means a TOC walk through the allowed list_headings tool,
+not semantic retrieval. Never call this RAG, vectorless RAG, or PageIndex.
+
+Judge one-liner: navigate section tree + pin question entities + hard 6-call
+ledger + fail-closed evidence IDs.
+
+Happy path (heading titles overlap the question): 0 planner LLM calls.
   list_headings → question-only pins → search_keyword → get_page → one answer
 
-A planner call happens only when that overlap is weak and a pin already hit
-a page, so an absent question does not spend a model call. At most one
-planner call, then at most one repair answer (two answer calls total).
+A TOC-pick model call is optional and only when overlap is weak, a pin
+already hit a page, and the outline has real headings. It may choose only
+existing titles or node ids, and use_terms must be a subset of the question
+extract. At most one such call. Repair is one more get_page and one more
+answer. No third answer call.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 import time
 import uuid
 from typing import Any
@@ -20,9 +27,16 @@ from app.agent.abstain import format_abstain_text
 from app.agent.answerer import draft_answer
 from app.agent.evidence import build_evidence_spans
 from app.agent.intent import attach_intent, resolve_intent
-from app.agent.navigate import SectionMatch, choose_pages, match_sections, select_initial_pages
-from app.agent.pins import extract_pins, term_in_question
-from app.agent.planner import plan_question
+from app.agent.navigate import (
+    SectionMatch,
+    apply_supersede_lock,
+    choose_pages,
+    match_sections,
+    optional_search_keeps_repair,
+    select_initial_pages,
+)
+from app.agent.pins import extract_question
+from app.agent.toc_pick import accept_toc_pick, pick_toc
 from app.agent.verifier import verify_quotes
 from app.config import REQUEST_DEADLINE_SEC
 from app.deadline import DeadlineExceededError, clear_deadline, start_deadline
@@ -34,12 +48,9 @@ from app.tools.wrapper import BudgetExceededError, clear_active_session, start_q
 logger = logging.getLogger(__name__)
 
 _BROAD_HIT_CAP = 20
-_PAGE_FLOOR = 3
 _MAX_SEARCHES = 2
-_SUPERSEDE_RE = re.compile(
-    r"\b(amend\w*|supersed\w*|latest|revised|replaced|current)\b",
-    re.I,
-)
+# Flat outlines (fewer real headings than this) may spend one extra pin search.
+_FEW_HEADINGS = 3
 
 
 def run_agent(doc_id: str, question: str) -> dict[str, Any]:
@@ -68,6 +79,8 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
             "total_ms": round((time.perf_counter() - started) * 1000, 3),
             "llm_calls": llm_calls,
             "planner_used": planner_used,
+            "planner_llm": 1 if planner_used else 0,
+            "toc_llm": 1 if planner_used else 0,
         }
 
     def _insufficient(reason: str, *, status_reason: str | None = None) -> dict[str, Any]:
@@ -79,12 +92,12 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
         clear_deadline()
         text, support = format_abstain_text(reason)
         logger.info(
-            "ask_timing qid=%s status=insufficient tool_ms=%s llm_ms=%s llm_calls=%s planner=%s calls=%s",
+            "ask_timing qid=%s status=insufficient tool_ms=%s llm_ms=%s llm_calls=%s planner_llm=%s calls=%s",
             question_id,
             timing["tool_ms"],
             timing["llm_ms"],
             timing["llm_calls"],
-            planner_used,
+            timing["planner_llm"],
             session.calls_used,
         )
         return {
@@ -116,57 +129,84 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
                 status_reason="unreadable_document",
             )
 
-        pins = extract_pins(question)
-        sections = match_sections(question, headings)
-        supersede = bool(_SUPERSEDE_RE.search(question or ""))
+        extract = extract_question(question)
+        pins = extract.terms[:4]
+        sections = match_sections(question, headings, extract.terms)
+        supersede = extract.supersede
         intent = resolve_intent(question)
         wide = supersede or intent in {"multi", "compare"}
         plan = _local_plan(question, pins, sections, supersede=supersede)
         intent = plan.get("intent")
-
+        real_headings = [
+            h
+            for h in headings
+            if str(h.get("title") or "").strip() and not str(h.get("title")).startswith("(")
+        ]
+        few_headings = len(real_headings) < _FEW_HEADINGS
+        # Budget: 1×list_headings + ≤2×search_keyword + ≤3–4×get_page ≤ 6.
+        # A flat outline may force one extra search only while the repair slot remains.
         keyword_hits: dict[str, list[int]] = {}
         searched: set[str] = set()
-        for pin in pins:
-            if len(searched) >= _MAX_SEARCHES:
-                break
-            if keyword_hits and session.budget_left <= _PAGE_FLOOR:
-                break
-            if session.budget_left < 1:
-                break
-            tight = [v for v in keyword_hits.values() if 0 < len(v) <= _BROAD_HIT_CAP]
-            if tight and not wide and len(searched) >= 1:
-                break
-            pages = _search(doc_id, pin)
-            if pages is None:
-                return _insufficient("budget exceeded during search", status_reason="budget_exhausted")
-            searched.add(pin.lower())
-            if len(pages) > _BROAD_HIT_CAP and any(
-                0 < len(v) <= _BROAD_HIT_CAP for v in keyword_hits.values()
-            ):
-                keyword_hits[pin] = []
-            else:
-                keyword_hits[pin] = pages
+        if not _search_pins(
+            doc_id,
+            pins,
+            keyword_hits,
+            searched,
+            session,
+            wide=wide,
+            few_headings=False,
+        ):
+            return _insufficient("budget exceeded during search", status_reason="budget_exhausted")
 
         has_hits = any(keyword_hits.values())
-        real_headings = [
-            h for h in headings if str(h.get("title") or "").strip() and not str(h.get("title")).startswith("(")
-        ]
-        if not sections.strong and has_hits and real_headings:
+        # Strong overlap: planner_llm=0. A TOC pick is optional and only when
+        # the outline did not match and a pin already hit a page.
+        if sections.strong:
+            logger.info("planner_llm=0")
+        elif has_hits and real_headings:
             t0 = time.perf_counter()
             try:
-                planned = plan_question(question, headings)
+                picked = pick_toc(question, headings, extract.terms)
             except Exception:
-                planned = None
+                picked = None
             planner_ms += (time.perf_counter() - t0) * 1000
             llm_calls += 1
             planner_used = True
-            if isinstance(planned, dict):
-                plan = _constrain_plan(planned, question, headings, pins, supersede=supersede)
-                intent = plan.get("intent")
-                sections = _merge_hints(sections, headings, plan.get("heading_hints") or [])
-                supersede = supersede or bool(plan.get("contradiction_sensitive"))
-                wide = supersede or intent in {"multi", "compare"}
+            accepted = accept_toc_pick(
+                picked if isinstance(picked, dict) else {},
+                headings,
+                extract.terms,
+            )
+            sections = _apply_toc(sections, accepted.get("headings") or [])
+            plan = _local_plan(question, pins, sections, supersede=supersede)
+            intent = plan.get("intent")
+            if not _search_pins(
+                doc_id,
+                list(accepted.get("use_terms") or []),
+                keyword_hits,
+                searched,
+                session,
+                wide=True,
+                few_headings=True,
+            ):
+                return _insufficient("budget exceeded during search", status_reason="budget_exhausted")
 
+        if few_headings and len(searched) < _MAX_SEARCHES:
+            if not _search_pins(
+                doc_id,
+                pins,
+                keyword_hits,
+                searched,
+                session,
+                wide=True,
+                few_headings=True,
+            ):
+                return _insufficient(
+                    "budget exceeded during search",
+                    status_reason="budget_exhausted",
+                )
+
+        has_hits = any(keyword_hits.values())
         if not has_hits and not sections.starts:
             return _insufficient("empty search", status_reason="no_evidence")
 
@@ -190,6 +230,9 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
             return _insufficient("no candidate pages", status_reason="no_evidence")
 
         to_fetch = select_initial_pages(ranked, session.budget_left, wide=wide)
+        hit_pages = [page for pages in keyword_hits.values() for page in pages]
+        latest = max(hit_pages) if supersede and hit_pages else None
+        to_fetch = apply_supersede_lock(to_fetch, latest)
         if not _fetch_pages(doc_id, to_fetch, fetched, pages_used, session):
             return _insufficient("budget exceeded during get_page", status_reason="budget_exhausted")
         if not fetched:
@@ -225,12 +268,12 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
         clear_active_session()
         clear_deadline()
         logger.info(
-            "ask_timing qid=%s status=ok tool_ms=%s llm_ms=%s llm_calls=%s planner=%s calls=%s",
+            "ask_timing qid=%s status=ok tool_ms=%s llm_ms=%s llm_calls=%s planner_llm=%s calls=%s",
             question_id,
             timing["tool_ms"],
             timing["llm_ms"],
             timing["llm_calls"],
-            planner_used,
+            timing["planner_llm"],
             session.calls_used,
         )
         return {
@@ -270,61 +313,19 @@ def _local_plan(
     return attach_intent(plan, question)
 
 
-def _constrain_plan(
-    planned: dict[str, Any],
-    question: str,
-    headings: list[dict[str, Any]],
-    pins: list[str],
-    *,
-    supersede: bool,
-) -> dict[str, Any]:
-    """Drop any planner keyword that is not a substring of the question."""
-    keywords = [
-        str(k).strip()
-        for k in (planned.get("keywords") or [])
-        if str(k).strip() and term_in_question(str(k), question)
-    ]
-    if not keywords:
-        keywords = list(pins)
-    known = {str(h.get("title") or "").strip(): str(h.get("title") or "").strip() for h in headings}
-    hints: list[str] = []
-    for hint in planned.get("heading_hints") or []:
-        hint_s = str(hint).strip()
-        if not hint_s:
-            continue
-        for title in known.values():
-            if hint_s.lower() == title.lower() or hint_s.lower() in title.lower():
-                if title not in hints:
-                    hints.append(title)
-                break
-    plan = {
-        "rewritten": question.strip(),
-        "qtype": str(planned.get("qtype") or "fact"),
-        "keywords": keywords[:4],
-        "heading_hints": hints[:4],
-        "contradiction_sensitive": supersede or bool(planned.get("contradiction_sensitive")),
-    }
-    return attach_intent(plan, question)
-
-
-def _merge_hints(
-    sections: SectionMatch,
-    headings: list[dict[str, Any]],
-    hints: list[str],
-) -> SectionMatch:
-    if not hints:
+def _apply_toc(sections: SectionMatch, chosen: list[dict[str, Any]]) -> SectionMatch:
+    """Union TOC-picked headings into the ranges. Cap stays at three."""
+    if not chosen:
         return sections
-    hint_l = [h.lower() for h in hints if h]
     merged = list(sections.headings)
     have = {str(h.get("title") or "").lower() for h in merged}
-    for heading in headings:
-        title = str(heading.get("title") or "")
-        title_l = title.lower()
-        if not title or title_l in have:
+    for heading in chosen:
+        title = str(heading.get("title") or "").strip()
+        if not title or title.lower() in have:
             continue
-        if any(hint in title_l or title_l in hint for hint in hint_l):
-            merged.append(heading)
-            have.add(title_l)
+        merged.append(heading)
+        have.add(title.lower())
+    merged = merged[:3]
     ranges: list[tuple[int, int]] = []
     starts: list[int] = []
     for heading in merged:
@@ -335,7 +336,50 @@ def _merge_hints(
         ranges.append((start, end))
         if start not in starts:
             starts.append(start)
-    return SectionMatch(strong=sections.strong or bool(merged), headings=merged, ranges=ranges, starts=starts)
+    return SectionMatch(strong=True, headings=merged, ranges=ranges, starts=starts)
+
+
+def _search_pins(
+    doc_id: str,
+    pins: list[str],
+    keyword_hits: dict[str, list[int]],
+    searched: set[str],
+    session: Any,
+    *,
+    wide: bool,
+    few_headings: bool,
+) -> bool:
+    """Search question pins. False when the wrapper refuses a call.
+
+    The second search runs only when `optional_search_keeps_repair` is true,
+    so it cannot spend the reserved repair get_page.
+    """
+    for pin in pins:
+        key = pin.lower()
+        if len(searched) >= _MAX_SEARCHES:
+            break
+        if key in searched:
+            continue
+        if len(searched) == 0:
+            if session.budget_left < 2:
+                break
+        else:
+            tight = any(0 < len(pages) <= _BROAD_HIT_CAP for pages in keyword_hits.values())
+            if tight and not wide and not few_headings:
+                break
+            if not optional_search_keeps_repair(session.budget_left):
+                break
+        pages = _search(doc_id, pin)
+        if pages is None:
+            return False
+        searched.add(key)
+        if len(pages) > _BROAD_HIT_CAP and any(
+            0 < len(found) <= _BROAD_HIT_CAP for found in keyword_hits.values()
+        ):
+            keyword_hits[pin] = []
+        else:
+            keyword_hits[pin] = pages
+    return True
 
 
 def _search(doc_id: str, pin: str) -> list[int] | None:

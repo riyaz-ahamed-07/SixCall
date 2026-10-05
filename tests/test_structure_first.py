@@ -1,10 +1,17 @@
-"""Structure-first navigation: question-only pins, dual index, one optional planner."""
+"""Structure-first navigation: question-only pins, dual index, one optional TOC pick."""
 
 from __future__ import annotations
 
-from app.agent.loop import _constrain_plan, run_agent
-from app.agent.navigate import SectionMatch, choose_pages
-from app.agent.pins import extract_pins, term_in_question
+from app.agent.loop import run_agent
+from app.agent.navigate import (
+    SectionMatch,
+    apply_supersede_lock,
+    choose_pages,
+    match_sections,
+    optional_search_keeps_repair,
+)
+from app.agent.pins import extract_pins, extract_question, term_in_question
+from app.agent.toc_pick import accept_toc_pick
 from app.index.dual_index import build_precision_index
 from app.store.document_store import (
     DocRecord,
@@ -29,20 +36,51 @@ def test_pins_are_substrings_and_do_not_invent_expansions():
     assert all(term_in_question(pin, longer) for pin in again)
 
 
-def test_constrain_plan_drops_keywords_not_in_the_question():
-    plan = _constrain_plan(
+def test_accept_toc_pick_drops_terms_not_in_the_extract():
+    picked = accept_toc_pick(
         {
-            "keywords": ["Artificial Intelligence", "AI"],
-            "heading_hints": ["Not in the outline"],
-            "qtype": "fact",
+            "sections": ["n0", "Not in the outline"],
+            "use_terms": ["Artificial Intelligence", "AI"],
         },
-        "What is AI?",
         [{"title": "Battery", "start": 1, "end": 1, "level": 1}],
         ["AI"],
-        supersede=False,
     )
-    assert plan["keywords"] == ["AI"]
-    assert plan["heading_hints"] == []
+    assert picked["use_terms"] == ["AI"]
+    assert picked["sections"] == ["n0"]
+    assert [h["title"] for h in picked["headings"]] == ["Battery"]
+
+
+def test_extract_records_quotes_clauses_capwords_and_supersede():
+    question = 'What does clause 4.2 say about the "refund window" after the amendment?'
+    extract = extract_question(question)
+    assert extract.supersede
+    assert any("4.2" in item for item in extract.clause_ids)
+    assert "refund window" in [item.lower() for item in extract.quotes]
+    assert "what" not in [item.lower() for item in extract.capwords]
+    assert all(term_in_question(term, question) for term in extract.terms)
+    days = extract_question("The limit is 14 days.")
+    assert "14" in days.numbers
+    assert all("14 days" not in item.lower() for item in days.clause_ids)
+
+
+def test_match_sections_keeps_at_most_three_ranges():
+    headings = [
+        {"title": f"Refund policy {i}", "start": i, "end": i, "level": 1}
+        for i in range(1, 6)
+    ]
+    matched = match_sections("What is the refund policy?", headings, ["refund policy"])
+    assert matched.strong
+    assert len(matched.headings) == 3
+    assert len(matched.ranges) == 3
+
+
+def test_supersede_lock_replaces_lowest_page_when_the_window_is_full():
+    # Later statement supersedes earlier.
+    locked = apply_supersede_lock([2, 3, 4], 40)
+    assert locked == [2, 3, 40]
+    assert apply_supersede_lock([2, 40], 40) == [2, 40]
+    assert optional_search_keeps_repair(3) is True
+    assert optional_search_keeps_repair(2) is False
 
 
 def test_supersede_lock_keeps_latest_hit_outside_the_section():
@@ -113,7 +151,7 @@ def test_happy_path_skips_planner_when_headings_overlap(tmp_path, monkeypatch):
         called.append(question)
         raise AssertionError("planner must stay off when headings overlap")
 
-    monkeypatch.setattr("app.agent.loop.plan_question", _boom)
+    monkeypatch.setattr("app.agent.loop.pick_toc", _boom)
 
     def _draft(**kwargs):
         return {
@@ -127,6 +165,8 @@ def test_happy_path_skips_planner_when_headings_overlap(tmp_path, monkeypatch):
     assert called == []
     assert result["status"] == "ok"
     assert result["timing"]["planner_used"] is False
+    assert result["timing"]["planner_llm"] == 0
+    assert result["timing"]["toc_llm"] == 0
     assert result["timing"]["llm_calls"] == 1
     assert result["calls_used"] > 0
     assert "elapsed_ms" in result["tool_trace"][0]
@@ -149,17 +189,14 @@ def test_weak_overlap_calls_planner_once_and_keeps_question_terms(tmp_path, monk
     store._docs[rec.doc_id] = rec
     calls = {"n": 0}
 
-    def _plan(question, headings):
+    def _pick(question, headings, allowed_terms):
         calls["n"] += 1
         return {
-            "rewritten": "invented restatement about batteries",
-            "qtype": "fact",
-            "keywords": ["lunar freight", "battery chemistry"],
-            "heading_hints": ["Battery capacity"],
-            "contradiction_sensitive": False,
+            "sections": ["n0", "Invented heading"],
+            "use_terms": ["lunar freight", "battery chemistry"],
         }
 
-    monkeypatch.setattr("app.agent.loop.plan_question", _plan)
+    monkeypatch.setattr("app.agent.loop.pick_toc", _pick)
 
     def _draft(**kwargs):
         assert 2 in kwargs["pages"]
