@@ -90,9 +90,9 @@ export default function DocsPage() {
             </h1>
             <p className="mt-4 max-w-2xl text-[15.5px] leading-relaxed text-ink-2">
               SixCall answers questions against ingested PDFs using exactly four
-              document tools and a hard six-call budget per question. It prefers
-              lexical search and table-of-contents structure over embeddings,
-              and abstains when evidence is insufficient.
+              document tools and a hard six-call budget per question. It walks
+              the section tree, pins terms copied from the question, and
+              abstains when evidence is insufficient.
             </p>
             <div className="mt-6 grid gap-3 sm:grid-cols-3">
               {[

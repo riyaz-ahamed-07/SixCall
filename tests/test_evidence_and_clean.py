@@ -30,6 +30,15 @@ def test_clean_page_text_strips_watermark_fragments():
     assert "Huntrix" in cleaned
 
 
+def test_scrubber_keeps_ate_and_lone_a_line():
+    raw = "The committee ate lunch.\nA\nPlease create a late date."
+    cleaned = clean_page_text(raw)
+    assert "ate" in cleaned
+    assert "create" in cleaned
+    assert "date" in cleaned
+    assert "\nA\n" in f"\n{cleaned}\n" or cleaned.splitlines()[1] == "A" or "A" in cleaned.splitlines()
+
+
 def test_filter_headings_drops_watermark_junk():
     from app.store.document_store import Heading, _filter_headings
 

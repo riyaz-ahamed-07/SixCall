@@ -156,12 +156,8 @@ def keyword_aliases(keyword: str) -> list[str]:
     if compact in {"c#", "csharp"}:
         aliases.extend(["C#", "c#", "csharp"])
 
-    if compact in {"ai"}:
-        aliases.extend(["AI", "Artificial Intelligence", "artificial intelligence"])
-
-    if compact in {"ml"}:
-        aliases.extend(["ML", "machine learning", "Machine Learning"])
-
+    # Glyph and spelling variants of the same token only. Do not expand a short
+    # token into a different phrase the caller did not pass in.
     if re.fullmatch(r"o\([a-z0-9+\-]+\)", compact):
         aliases.append(compact)
         aliases.append(compact.upper())

@@ -34,6 +34,16 @@ def _print_ask_pretty(answer: Any, question: str) -> None:
     print(f"  Pages:  {pages}")
     print(f"  Calls:  {answer.calls_used}/6")
     print(f"  QID:    {answer.question_id}")
+    timing = getattr(answer, "timing", None) or {}
+    if timing:
+        print(
+            "  Time:   "
+            f"tools {timing.get('tool_ms', 0)} ms · "
+            f"llm {timing.get('llm_ms', 0)} ms "
+            f"({timing.get('llm_calls', 0)} call(s), "
+            f"planner {'on' if timing.get('planner_used') else 'off'}) · "
+            f"total {timing.get('total_ms', 0)} ms"
+        )
     print(_hr())
     print()
     print("  ANSWER")

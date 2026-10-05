@@ -109,16 +109,9 @@ def _heuristic_keywords(question: str) -> list[str]:
         if len(keywords) >= 4:
             break
 
-    # Expand common acronyms to a longer alternate for sparse indexes.
-    expanded: list[str] = []
-    for k in keywords:
-        expanded.append(k)
-        low = k.lower()
-        if low == "ai" and "Artificial Intelligence" not in expanded:
-            expanded.append("Artificial Intelligence")
-        elif low == "ml" and "machine learning" not in {x.lower() for x in expanded}:
-            expanded.append("machine learning")
-    return expanded[:4] or [question.strip()[:40]]
+    # Pins stay inside the question. Do not expand a short token into a
+    # different phrase the user did not write.
+    return keywords[:4] or [question.strip()[:40]]
 
 
 def _is_usable_keyword(keyword: str, question: str) -> bool:
