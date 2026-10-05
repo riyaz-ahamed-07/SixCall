@@ -4,8 +4,9 @@ import logging
 from typing import Any
 
 from app.agent.evidence import build_evidence_spans, resolve_quote_refs
+from app.agent.intent import is_coding_question
 from app.llm.client import get_llm
-from app.prompts.system import ANSWER_SYSTEM, build_answer_user
+from app.prompts.system import ANSWER_SYSTEM, CODING_ANSWER_SYSTEM, build_answer_user
 
 
 def draft_answer(
@@ -18,8 +19,10 @@ def draft_answer(
 ) -> dict[str, Any]:
     spans = build_evidence_spans(pages)
     spans_by_id = {str(s["id"]).upper(): s for s in spans}
+    coding = is_coding_question(question) or str(plan.get("intent") or "") == "howto"
+    system = CODING_ANSWER_SYSTEM if coding else ANSWER_SYSTEM
     messages = [
-        {"role": "system", "content": ANSWER_SYSTEM},
+        {"role": "system", "content": system},
         {
             "role": "user",
             "content": build_answer_user(
@@ -52,7 +55,7 @@ def draft_answer(
     if status not in {"ok", "insufficient_information"}:
         status = "insufficient_information"
 
-    quotes = resolve_quote_refs(data.get("quotes") or [], spans_by_id)
+    quotes = resolve_quote_refs(data.get("quotes") or [], spans_by_id, pages)
 
     answer = str(data.get("answer") or "").strip()
 
@@ -73,8 +76,15 @@ def draft_answer(
                 "error": "missing_quotes",
             }
 
-    if status == "insufficient_information" and not answer:
-        answer = "insufficient information"
+    if status == "insufficient_information":
+        # Keep explanatory prose only — the agent loop adds the label once.
+        if not answer or answer.lower() == "insufficient information":
+            answer = "insufficient information"
+        elif answer.lower().startswith("insufficient information"):
+            from app.agent.abstain import strip_abstain_label
+
+            rest = strip_abstain_label(answer)
+            answer = rest or "insufficient information"
 
     return {
         "status": status,

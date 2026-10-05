@@ -63,3 +63,58 @@ def test_evidence_ids_resolve_to_exact_verifiable_spans():
     ok, failures = verify_quotes(quotes, pages)
     assert ok is True
     assert failures == []
+
+
+def test_extend_quotes_lengthens_short_citation():
+    from app.agent.evidence import extend_quotes
+
+    pages = {
+        1: (
+            "Numerical operators allow you to create complex expressions involving "
+            "either numerical literals and/or numerical variables. The unary negation "
+            "operator allows you to negate a numerical literal or variable."
+        )
+    }
+    short = [{"text": "Numerical operators allow you", "page": 1}]
+    extended = extend_quotes(short, pages)
+    assert len(extended[0]["text"].split()) > len(short[0]["text"].split())
+    ok, failures = verify_quotes(extended, pages)
+    assert ok is True
+    assert failures == []
+
+
+def test_evidence_keeps_code_lines_intact():
+    pages = {
+        1: (
+            "Write a CSV to JSON converter.\n"
+            "  FILE *in = fopen(\"data.csv\", \"r\");\n"
+            "  while (fgets(buf, sizeof(buf), in)) {\n"
+            "    printf(\"%s\\n\", buf);\n"
+            "  }\n"
+            "Then close the file."
+        )
+    }
+    spans = build_evidence_spans(pages)
+    texts = [s["text"] for s in spans]
+    assert any("fopen" in t for t in texts)
+    assert any("fgets" in t for t in texts)
+    code_quote = next(t for t in texts if "fopen" in t)
+    ok, failures = verify_quotes([{"text": code_quote, "page": 1}], pages)
+    assert ok is True
+    assert failures == []
+
+
+def test_repair_quotes_maps_paraphrase_to_code_span():
+    from app.agent.evidence import repair_quotes
+
+    pages = {
+        1: 'int main(void) {\n  FILE *fp = fopen("a.csv", "r");\n  return 0;\n}\n'
+    }
+    repaired = repair_quotes(
+        [{"text": "open a.csv with fopen", "page": 1}],
+        pages,
+    )
+    assert repaired
+    ok, failures = verify_quotes(repaired, pages)
+    assert ok is True
+    assert failures == []

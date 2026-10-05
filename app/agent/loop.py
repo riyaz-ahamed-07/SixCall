@@ -5,6 +5,7 @@ from typing import Any
 
 from app.config import REQUEST_DEADLINE_SEC
 from app.deadline import DeadlineExceededError, clear_deadline, start_deadline
+from app.agent.abstain import format_abstain_text
 from app.agent.answerer import draft_answer
 from app.agent.planner import plan_question
 from app.agent.scorer import score_pages
@@ -21,8 +22,23 @@ from app.tools.wrapper import (
 _BROAD_HIT_CAP = 20
 # Keep enough budget for evidence reads after search.
 _MIN_PAGE_RESERVE = 1
+_MIN_PAGE_RESERVE_CODING = 3
 # Cap page reads — more pages = bigger answer prompt = slower demos.
 _MAX_PAGES_FETCH = 2
+_MAX_PAGES_FETCH_HOWTO = 3
+_MAX_SEARCHES_CODING = 2
+
+
+def _pages_fetch_cap(intent: str | None) -> int:
+    if intent in {"howto", "multi"}:
+        return _MAX_PAGES_FETCH_HOWTO
+    return _MAX_PAGES_FETCH
+
+
+def _page_reserve(plan: dict[str, Any]) -> int:
+    if plan.get("coding") or plan.get("intent") == "howto":
+        return _MIN_PAGE_RESERVE_CODING
+    return _MIN_PAGE_RESERVE
 
 
 def run_agent(doc_id: str, question: str) -> dict[str, Any]:
@@ -46,14 +62,15 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
         evidence_cleared = True
         clear_active_session()
         clear_deadline()
+        text, support = format_abstain_text(reason)
         return {
-            "text": "insufficient information",
+            "text": text,
             "status": "insufficient_information",
             "pages_used": sorted(set(pages_used)),
             "tool_trace": [r.as_dict() for r in session.trace],
             "calls_used": session.calls_used,
             "question_id": question_id,
-            "reason": reason,
+            "reason": support,
             "status_reason": status_reason or reason,
             "intent": intent,
             "strategy": strategy,
@@ -84,11 +101,19 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
 
         # Preserve planner keyword order (most distinctive first).
         keywords = [str(k).strip() for k in (plan.get("keywords") or []) if str(k).strip()]
+        page_reserve = _page_reserve(plan)
+        max_searches = (
+            _MAX_SEARCHES_CODING
+            if plan.get("coding") or plan.get("intent") == "howto"
+            else len(keywords)
+        )
 
         keyword_hits: dict[str, list[int]] = {}
         for i, kw in enumerate(keywords):
+            if i >= max_searches:
+                break
             # Reserve slots for page reads before spending on another search.
-            if session.budget_left <= _MIN_PAGE_RESERVE and keyword_hits:
+            if session.budget_left <= page_reserve and keyword_hits:
                 break
             if session.budget_left < 1:
                 break
@@ -96,7 +121,7 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
             if (
                 i > 0
                 and tight
-                and plan.get("intent") not in {"multi", "compare"}
+                and plan.get("intent") not in {"multi", "compare", "howto"}
             ):
                 break
             try:
@@ -116,9 +141,9 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
             else:
                 keyword_hits[kw] = pages
 
-        if not any(keyword_hits.values()) and session.budget_left > _MIN_PAGE_RESERVE:
+        if not any(keyword_hits.values()) and session.budget_left > page_reserve:
             for hint in plan.get("heading_hints") or []:
-                if session.budget_left <= _MIN_PAGE_RESERVE:
+                if session.budget_left <= page_reserve:
                     break
                 rescue = str(hint).strip()
                 if len(rescue) < 3:
@@ -153,22 +178,26 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
                 top_k=top_k,
             )
             # Compare/multi: try to cover distinct keyword hit sets.
-            if plan.get("intent") in {"multi", "compare"}:
+            if plan.get("intent") in {"multi", "compare", "howto"}:
                 ranked = _ensure_coverage(ranked, keyword_hits, top_k)
             strategy = "tree+keyword"
 
-        # Prefer outline start pages for matched headings ahead of TOC-only keyword hits.
+        # Outline section starts — append after keyword ranks so rare hits (e.g. CSV) win.
         tree_boost = _heading_start_pages(headings, plan.get("heading_hints") or [])
         if tree_boost:
-            ranked = list(dict.fromkeys([*tree_boost, *ranked]))[
+            ranked = list(dict.fromkeys([*ranked, *tree_boost]))[
                 : max(1, session.budget_left)
             ]
 
         if not ranked:
             return _insufficient("no candidate pages", status_reason="no_evidence")
 
-        # Gather affordable evidence before the single generation (capped for latency).
-        to_fetch = ranked[: min(session.budget_left, _MAX_PAGES_FETCH)]
+        fetch_cap = min(session.budget_left, _pages_fetch_cap(plan.get("intent")))
+        to_fetch = _expand_neighbor_pages(
+            ranked[:fetch_cap],
+            ranked,
+            max_total=fetch_cap,
+        )
         for page_no in to_fetch:
             if session.budget_left < 1:
                 break
@@ -206,12 +235,20 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
         if not str(draft.get("answer") or "").strip():
             return _insufficient("empty answer", status_reason="invalid_output")
 
-        ok, failures = verify_quotes(draft.get("quotes") or [], fetched)
+        quotes = list(draft.get("quotes") or [])
+        ok, failures = verify_quotes(quotes, fetched)
         if not ok:
-            return _insufficient(
-                "quote verification failed: " + "; ".join(failures[:3]),
-                status_reason="invalid_output",
-            )
+            from app.agent.evidence import repair_quotes
+
+            repaired = repair_quotes(quotes, fetched)
+            ok2, failures2 = verify_quotes(repaired, fetched)
+            if not ok2:
+                return _insufficient(
+                    "quote verification failed: "
+                    + "; ".join((failures2 or failures)[:3]),
+                    status_reason="invalid_output",
+                )
+            quotes = repaired
 
         fetched.clear()
         evidence_cleared = True
@@ -224,7 +261,7 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
             "tool_trace": [r.as_dict() for r in session.trace],
             "calls_used": session.calls_used,
             "question_id": question_id,
-            "quotes": draft.get("quotes") or [],
+            "quotes": quotes,
             "evidence_cleared": evidence_cleared,
             "intent": intent,
             "strategy": strategy,
@@ -257,6 +294,27 @@ def _ensure_coverage(
             else:
                 chosen.append(pick)
     return chosen[:top_k]
+
+
+def _expand_neighbor_pages(
+    chosen: list[int],
+    pool: list[int],
+    *,
+    max_total: int,
+) -> list[int]:
+    """Pull adjacent pages from the ranked pool (code/samples often span page breaks)."""
+    if max_total < 1 or not chosen:
+        return chosen[:max_total]
+    pool_set = set(pool)
+    out = list(chosen)
+    for p in chosen:
+        if len(out) >= max_total:
+            break
+        for n in (p + 1, p - 1):
+            if n in pool_set and n not in out:
+                out.append(n)
+                break
+    return out[:max_total]
 
 
 def _heading_start_pages(

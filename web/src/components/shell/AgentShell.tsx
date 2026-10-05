@@ -21,7 +21,6 @@ import {
   deleteDocument,
   ingestPdf,
   listDocuments,
-  overviewDocument,
   type AskAnswer,
   type ChatTurn,
   type DocSummary,
@@ -30,9 +29,9 @@ import { useAuth } from "@/lib/auth";
 import { formatDocName } from "@/lib/docs";
 
 const SUGGESTIONS = [
-  "What is this document about?",
   "Summarize the introduction",
   "Define the main concept on page 1",
+  "What are the main sections?",
 ];
 
 const CHATS_KEY = "sixcall.chats.v2";
@@ -370,60 +369,6 @@ export default function AgentShell({ userEmail }: { userEmail?: string }) {
       });
       setActiveChatId(chatId);
       setStatus(`Ready · ${result.filename}`);
-      setUploading(false);
-      setUploadName(null);
-
-      // Light TOC orientation (1 tool: list_headings) — show as first assistant turn.
-      const requestId = ++askRequestId.current;
-      setAsking(true);
-      setStatus("Orienting from headings…");
-      try {
-        const answer = await overviewDocument(result.doc_id, undefined, {
-          light: true,
-        });
-        if (
-          requestId !== askRequestId.current ||
-          askScope.current?.chatId !== chatId ||
-          askScope.current?.docId !== result.doc_id
-        ) {
-          return;
-        }
-        setChats((prev) => {
-          const next = prev.map((c) => {
-            if (c.id !== chatId) return c;
-            return {
-              ...c,
-              turns: [
-                {
-                  id: nextTurnId("u"),
-                  role: "user" as const,
-                  text: "What is this document about?",
-                },
-                {
-                  id: answer.question_id || nextTurnId("a"),
-                  role: "assistant" as const,
-                  text: answer.text,
-                  answer,
-                },
-              ],
-            };
-          });
-          saveChats(next, chatId);
-          return next;
-        });
-        setStatus(`Ready · ${result.filename}`);
-      } catch (err) {
-        if (requestId === askRequestId.current) {
-          setError(
-            err instanceof Error ? err.message : "Could not summarize document",
-          );
-          setStatus(`Ready · ${result.filename}`);
-        }
-      } finally {
-        if (requestId === askRequestId.current) {
-          setAsking(false);
-        }
-      }
       return;
     } catch (err) {
       setError(err instanceof Error ? err.message : "Upload failed");
@@ -769,7 +714,13 @@ export default function AgentShell({ userEmail }: { userEmail?: string }) {
                       followUpsDisabled={asking}
                       onFollowUp={(text) => void handleAsk(text)}
                     />
-                    {!ok && answer?.reason ? (
+                    {!ok &&
+                    answer?.reason &&
+                    !(turn.text || "")
+                      .toLowerCase()
+                      .includes(
+                        (answer.reason || "").toLowerCase().slice(0, 40),
+                      ) ? (
                       <p className="mt-3 border-t border-line pt-2.5 text-[12px] leading-relaxed text-orange">
                         {answer.reason}
                       </p>

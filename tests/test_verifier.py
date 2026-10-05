@@ -4,6 +4,18 @@ from app.agent.verifier import verify_quotes
 from app.agent.answerer import draft_answer
 
 
+def test_quote_verifier_accepts_code_contiguous_span():
+    pages = {
+        1: 'int main(void) {\n  printf("hello");\n  return 0;\n}\n'
+    }
+    ok, failures = verify_quotes(
+        [{"text": 'printf("hello");', "page": 1}],
+        pages,
+    )
+    assert ok is True
+    assert failures == []
+
+
 def test_quote_verifier_accepts_exact_span():
     pages = {1: "The refund window is fourteen days for unused items."}
     ok, failures = verify_quotes(

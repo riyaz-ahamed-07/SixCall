@@ -26,11 +26,16 @@ _FORMAT: dict[Intent, str] = {
     ),
     "howto": (
         "FORMAT=howto: Give ordered steps the document describes. "
-        "Keep steps faithful to the excerpts; quote key procedural lines."
+        "Keep steps faithful to the excerpts; quote key procedural lines. "
+        "If excerpts include source code, pseudocode, or Code Sample blocks, "
+        "include those lines in the answer (do not invent APIs) and cite evidence ids. "
+        "If the question restates an exercise, summarize the exercise requirements "
+        "and any example I/O from the excerpts when a full solution is not shown."
     ),
     "fact": (
         "FORMAT=fact: 2–4 sentences answering directly with the needed detail from excerpts. "
-        "Include supporting context only if present."
+        "Include supporting context only if present. "
+        "Pseudocode and Code Sample lines in excerpts count as sample code when asked."
     ),
     "absent": (
         "FORMAT=absent: If excerpts lack the answer, status=insufficient_information. "
@@ -57,7 +62,7 @@ def resolve_intent(question: str, qtype: str | None = None) -> Intent:
         return "compare"
     if _looks_prove(q):
         return "prove"
-    if _looks_howto(q):
+    if _looks_howto(q) or _looks_code_example(q) or _looks_pseudocode(q):
         return "howto"
     if _looks_define(q):
         return "define"
@@ -72,11 +77,20 @@ def format_card(intent: Intent) -> str:
     return _FORMAT[intent]
 
 
+def is_coding_question(question: str) -> bool:
+    """True for sample-code / program / pseudocode asks (coding answer path)."""
+    q = (question or "").lower().strip()
+    if not q:
+        return False
+    return _looks_howto(q) or _looks_code_example(q) or _looks_pseudocode(q)
+
+
 def attach_intent(plan: dict[str, Any], question: str) -> dict[str, Any]:
     intent = resolve_intent(question, str(plan.get("qtype") or ""))
     out = dict(plan)
     out["intent"] = intent
     out["format_card"] = format_card(intent)
+    out["coding"] = is_coding_question(question)
     return out
 
 
@@ -104,9 +118,33 @@ def _looks_compare(q: str) -> bool:
     )
 
 
+def _looks_code_example(q: str) -> bool:
+    return bool(
+        re.search(
+            r"\b("
+            r"sample code|code sample|code snippet|example code|"
+            r"show (me )?code|give (me )?(the )?code|"
+            r"give (me )?(those |the )?(conceptual )?(pseudocode|illustrations?)"
+            r")\b",
+            q,
+        )
+    )
+
+
+def _looks_pseudocode(q: str) -> bool:
+    return bool(re.search(r"\b(pseudocode|pseudo[\s-]?code)\b", q))
+
+
 def _looks_howto(q: str) -> bool:
     return bool(
-        re.search(r"\b(how (do|to|can|does)|steps to|procedure|algorithm for)\b", q)
+        re.search(
+            r"\b("
+            r"how (do|to|can|does)|steps to|procedure|algorithm for|"
+            r"write (a |an )?(program|function|code|script)|"
+            r"implement|parse|convert|produce .* output"
+            r")\b",
+            q,
+        )
     )
 
 

@@ -8,6 +8,11 @@ from app.textutil import normalize_text
 _WS_RE = re.compile(r"\s+")
 MIN_QUOTE_CHARS = 8
 
+_CODEISH_RE = re.compile(
+    r"[{};#]|->|::|</?\w|\b(def|class|return|include|printf|scanf|int|void|main|import)\b",
+    re.I,
+)
+
 
 def _norm_for_match(text: str) -> str:
     """Narrow normalization for exact span checks (whitespace/Unicode only)."""
@@ -20,6 +25,10 @@ def _is_word_char(ch: str) -> bool:
     # Treat alnum and common token glue as "inside a word" so
     # "eligible" cannot match inside "ineligible".
     return ch.isalnum() or ch in {"_", "*", "∗"}
+
+
+def _looks_like_code_quote(text: str) -> bool:
+    return bool(_CODEISH_RE.search(text or ""))
 
 
 def _has_bounded_span(haystack: str, needle: str) -> bool:
@@ -39,13 +48,31 @@ def _has_bounded_span(haystack: str, needle: str) -> bool:
         start = i + 1
 
 
+def quote_matches_page(quote: str, page_text: str) -> bool:
+    """True if quote is an exact contiguous span of the page (code-aware)."""
+    text = (quote or "").strip()
+    if not text or text in {".", "...", "…"}:
+        return False
+    q_norm = _norm_for_match(text)
+    if len(q_norm) < MIN_QUOTE_CHARS:
+        return False
+    p_norm = _norm_for_match(page_text or "")
+    if not p_norm:
+        return False
+    # Code lines often sit mid-token after PDF glue; accept contiguous match.
+    if _looks_like_code_quote(text):
+        return q_norm in p_norm
+    return _has_bounded_span(p_norm, q_norm)
+
+
 def verify_quotes(
-    quotes: list[dict[str, Any]], pages: dict[int, str]
+    quotes: list[dict[str, Any]], pages: dict[int, str], *, min_chars: int | None = None
 ) -> tuple[bool, list[str]]:
     """Every quote must be an exact contiguous word-bounded span of a fetched page."""
     failures: list[str] = []
     if not quotes:
         return False, ["no quotes provided"]
+    floor = MIN_QUOTE_CHARS if min_chars is None else max(1, int(min_chars))
 
     for q in quotes:
         text = str(q.get("text") or "").strip()
@@ -66,10 +93,14 @@ def verify_quotes(
             failures.append("degenerate quote")
             continue
         q_norm = _norm_for_match(text)
-        if len(q_norm) < MIN_QUOTE_CHARS:
-            failures.append(f"quote too short on page {page_i} (min {MIN_QUOTE_CHARS} chars)")
+        if len(q_norm) < floor:
+            failures.append(f"quote too short on page {page_i} (min {floor} chars)")
             continue
         p_norm = _norm_for_match(source)
+        if _looks_like_code_quote(text):
+            if q_norm not in p_norm:
+                failures.append(f"quote not found as contiguous span on page {page_i}")
+            continue
         if not _has_bounded_span(p_norm, q_norm):
             failures.append(f"quote not found as bounded span on page {page_i}")
 
