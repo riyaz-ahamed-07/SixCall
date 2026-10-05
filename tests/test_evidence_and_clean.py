@@ -59,6 +59,45 @@ def test_filter_headings_drops_watermark_junk():
     assert all("WATER" not in t.upper() for t in titles)
 
 
+def test_genre_spans_keep_table_rows_code_lines_and_later_pages():
+    pages = {
+        1: "\n".join(f"Sentence number {i} is filler text here." for i in range(30)),
+        2: "Item | Days | Fee\nWidget | 14 | 3\nGadget | 30 | 5",
+        3: "int refundWindow = 14;\nreturn refundWindow;",
+    }
+    spans = build_evidence_spans(pages)
+    page1 = [s for s in spans if s["page"] == 1]
+    assert 0 < len(page1) <= 8
+    table = [s for s in spans if s["page"] == 2]
+    assert table
+    assert all(s["genre"] == "table" for s in table)
+    assert any("14" in s["text"] for s in table)
+    code = [s for s in spans if s["page"] == 3]
+    assert code
+    assert all(s["genre"] == "code" for s in code)
+    assert any("refundWindow" in s["text"] for s in code)
+    assert all(s["page"] in pages for s in spans)
+
+
+def test_answer_draft_rejects_malformed_json(monkeypatch):
+    from app.agent.answerer import draft_answer
+
+    class _FakeLLM:
+        def complete_json(self, *args, **kwargs):
+            return ["not", "an", "object"]
+
+    monkeypatch.setattr("app.agent.answerer.get_llm", lambda: _FakeLLM())
+    draft = draft_answer(
+        question="What is the refund window?",
+        plan={"intent": "fact", "format_card": "", "rewritten": "", "qtype": "fact"},
+        pages={1: "The refund window is 14 days."},
+        unused_candidates=[],
+        budget_left=0,
+    )
+    assert draft["status"] == "insufficient_information"
+    assert draft.get("error") == "invalid_output"
+
+
 def test_evidence_ids_resolve_to_exact_verifiable_spans():
     pages = {
         1: (

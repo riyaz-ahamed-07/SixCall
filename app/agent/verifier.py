@@ -22,7 +22,7 @@ _CODEISH_RE = re.compile(
 )
 _DIGIT_RE = re.compile(r"\d+")
 _NEGATION_RE = re.compile(
-    r"\b(?:not|no|never|none|without|cannot|can't|dont|don't|doesnt|doesn't)\b",
+    r"\b(?:not|no|except|never|none|without|cannot|can't|dont|don't|doesnt|doesn't)\b",
     re.I,
 )
 

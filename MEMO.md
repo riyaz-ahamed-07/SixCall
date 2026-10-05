@@ -7,7 +7,7 @@
 1. **Ingest** — PyMuPDF extracts page text and a section tree (TOC, then font size, then lexical heading lines). `search_keyword` keeps two lexical maps internally: precision (unstemmed numbers, CapWords, exact phrases) and recall (stemmed tokens). `doc_id` is `sha256(owner:bytes)[:16]`.
 2. **Route** — New questions always use tools. `SIXCALL_FOLLOWUPS` defaults off; a result with zero tool calls is sent back through the agent. Overview asks still sample pages through `get_page`.
 3. **Agent** — Pins are copied from the question (numbers, CapWords, quotes, clause ids). Heading titles are matched locally, at most three ranges. `search_keyword` returns page numbers only: precision first, stemmed recall only when precision names nothing. Overlap that is already strong makes no planner call (`planner_llm=0`). A weak outline may spend one TOC pick that can only return existing titles and terms already in the question. One answer call cites span ids built after `get_page`. When a later statement can supersede an earlier one, the newest keyword hit stays in the pages that are read.
-4. **Fail closed** — Unknown span ids, swapped numbers, and dropped negations are rejected in pure Python. Empty evidence becomes `insufficient information`.
+4. **Fail closed** — Spans are built only from pages `get_page` already returned (sentences, table rows, or code lines). Unknown span ids, swapped numbers, and dropped negations are rejected in pure Python. A plan, draft, or ask result that does not match its shape is refused. Empty evidence becomes `insufficient information`.
 
 ## Why this shape
 

@@ -2,6 +2,8 @@
 
 Ids are stable for a given set of fetched pages: pages are walked in order
 and each page gets at most 8 spans so a long early page cannot use every id.
+Prose becomes sentence spans. A table row stays one span, digits included.
+A code line stays one span, camelCase included.
 """
 
 from __future__ import annotations
@@ -9,6 +11,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.agent.schemas import EvidenceSpan
 from app.agent.verifier import fragment_of_span, near_span
 
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
@@ -19,6 +22,7 @@ _MAX_SPANS_PER_PAGE = 8
 _MAX_SPANS = 32
 _SNAP_MIN = 90
 
+_TABLE_SPLIT_RE = re.compile(r"\S(?: {2,}|\t)\S(?: {2,}|\t)\S")
 _CODE_LINE_RE = re.compile(
     r"(^\s{2,})"
     r"|[{};#]"
@@ -46,8 +50,21 @@ def looks_like_code(text: str) -> bool:
     return False
 
 
-def span_genre(text: str) -> str:
+def looks_like_table_row(text: str) -> bool:
+    line = text or ""
+    if "\t" in line or line.count("|") >= 1:
+        return True
+    return bool(_TABLE_SPLIT_RE.search(line))
+
+
+def span_genre(text: str, kind: str | None = None) -> str:
     """Label a span so the answer call can prefer the right kind of line."""
+    if kind == "table":
+        return "table"
+    if kind == "code":
+        return "code"
+    if looks_like_table_row(text):
+        return "table"
     if looks_like_code(text):
         return "code"
     low = (text or "").lower()
@@ -70,22 +87,27 @@ def build_evidence_spans(pages: dict[int, str]) -> list[dict[str, Any]]:
         if not text:
             continue
         page_count = 0
-        for chunk in _iter_chunks(text):
+        for kind, chunk in _iter_chunks(text):
+            # Collapse runs of space. camelCase and digits stay as written.
             chunk = " ".join(chunk.split()).strip()
-            if len(chunk) < _MIN_SPAN_CHARS:
+            floor = 1 if kind in {"table", "code"} else _MIN_SPAN_CHARS
+            if len(chunk) < floor:
                 continue
-            max_words = _MAX_CODE_QUOTE_WORDS if looks_like_code(chunk) else _MAX_QUOTE_WORDS
-            for piece in _chunk_words(chunk, max_words):
-                if len(piece) < _MIN_SPAN_CHARS:
+            max_words = _MAX_CODE_QUOTE_WORDS if kind == "code" else _MAX_QUOTE_WORDS
+            pieces = [chunk] if kind in {"table", "code"} else _chunk_words(chunk, max_words)
+            for piece in pieces:
+                if len(piece) < floor:
                     continue
-                spans.append(
-                    {
-                        "id": f"E{len(spans) + 1}",
-                        "page": int(page),
-                        "text": piece,
-                        "genre": span_genre(piece),
-                    }
-                )
+                try:
+                    span = EvidenceSpan(
+                        id=f"E{len(spans) + 1}",
+                        page=int(page),
+                        text=piece,
+                        genre=span_genre(piece, kind),
+                    )
+                except Exception:
+                    continue
+                spans.append(span.model_dump())
                 page_count += 1
                 if page_count >= _MAX_SPANS_PER_PAGE or len(spans) >= _MAX_SPANS:
                     break
@@ -149,8 +171,22 @@ def resolve_quote_refs(
     return quotes
 
 
-def _iter_chunks(text: str) -> list[str]:
-    out: list[str] = []
+def _line_kind(line: str) -> str:
+    raw = line or ""
+    if not raw.strip():
+        return "blank"
+    if "\t" in raw or raw.count("|") >= 1:
+        return "table"
+    if looks_like_code(raw):
+        return "code"
+    if _TABLE_SPLIT_RE.search(raw):
+        return "table"
+    return "prose"
+
+
+def _iter_chunks(text: str) -> list[tuple[str, str]]:
+    """(kind, text) pairs. Kind is prose, table, or code. No ingest text is read."""
+    out: list[tuple[str, str]] = []
     prose_buf: list[str] = []
 
     def flush_prose() -> None:
@@ -161,20 +197,24 @@ def _iter_chunks(text: str) -> list[str]:
         for chunk in _SENT_SPLIT_RE.split(block):
             c = chunk.strip()
             if c:
-                out.append(c)
+                out.append(("prose", c))
 
     for line in text.splitlines():
         raw = line.rstrip()
-        if looks_like_code(raw):
+        kind = _line_kind(raw)
+        if kind == "blank":
             flush_prose()
-            stripped = raw.strip()
-            if stripped:
-                out.append(stripped)
-        else:
+            continue
+        if kind == "prose":
             prose_buf.append(raw)
+            continue
+        flush_prose()
+        stripped = raw.strip()
+        if stripped:
+            out.append((kind, stripped))
     flush_prose()
     if not out and text.strip():
-        out.extend(c.strip() for c in _SENT_SPLIT_RE.split(text) if c.strip())
+        out.extend(("prose", c.strip()) for c in _SENT_SPLIT_RE.split(text) if c.strip())
     return out
 
 

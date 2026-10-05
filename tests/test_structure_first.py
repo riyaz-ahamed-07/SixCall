@@ -10,7 +10,7 @@ from app.agent.navigate import (
     match_sections,
     optional_search_keeps_repair,
 )
-from app.agent.pins import extract_pins, extract_question, term_in_question
+from app.agent.pins import extract_pins, extract_question, term_allowed, term_in_question
 from app.agent.toc_pick import accept_toc_pick
 from app.index.dual_index import build_precision_index
 from app.store.document_store import (
@@ -61,6 +61,16 @@ def test_extract_records_quotes_clauses_capwords_and_supersede():
     days = extract_question("The limit is 14 days.")
     assert "14" in days.numbers
     assert all("14 days" not in item.lower() for item in days.clause_ids)
+    dated = extract_question("What changed on 2024-01-15 except the freight rule?")
+    assert "2024-01-15" in dated.dates
+    assert "except" in dated.negations
+    assert dated.supersede is False
+    updated = extract_question("What is the current update to clause 7.2?")
+    assert updated.supersede
+    assert any("update" in cue.lower() for cue in updated.supersede_cues)
+    assert any("7.2" in item for item in updated.clause_ids)
+    assert term_allowed("clause 7.2", updated)
+    assert term_allowed("battery chemistry", updated) is False
 
 
 def test_match_sections_keeps_at_most_three_ranges():
@@ -220,6 +230,77 @@ def test_weak_overlap_calls_planner_once_and_keeps_question_terms(tmp_path, monk
     assert searched
     assert all("battery" not in str(kw).lower() for kw in searched)
     assert all(term_in_question(str(kw), "What is the lunar freight warranty?") for kw in searched)
+    assert all(term_allowed(str(kw), extract_question("What is the lunar freight warranty?")) for kw in searched)
+    clear_active_session()
+
+
+def test_flat_outline_extra_search_keeps_the_repair_slot(tmp_path, monkeypatch):
+    clear_active_session()
+    quote = "The refund window is 14 days."
+    pages = {
+        1: f"Refund window section. {quote}",
+        2: "Shipping fee section. The shipping fee is five dollars.",
+        3: f"More background about the refund window. {quote}",
+        4: f"Still more background about the refund window. {quote}",
+        5: f"Later background about the refund window. {quote}",
+        6: f"Last background about the refund window. {quote}",
+    }
+    store = reset_store_for_tests(tmp_path / "docs")
+    rec = DocRecord(
+        doc_id="abcd1234abcd1234",
+        meta={"page_count": 6, "title": "policy"},
+        pages=pages,
+        labels={},
+        headings=[Heading(title="Refund window", level=1, start=1, end=2)],
+        index=build_inverted_index(pages),
+        precision_index=build_precision_index(pages),
+    )
+    store._docs[rec.doc_id] = rec
+    question = "What is the refund window for the shipping fee?"
+    extract = extract_question(question)
+    calls = {"n": 0}
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("strong overlap must not call a TOC model")
+
+    monkeypatch.setattr("app.agent.loop.pick_toc", _boom)
+
+    def _draft(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            assert kwargs["budget_left"] >= 1
+            assert kwargs["unused_candidates"]
+            return {
+                "status": "insufficient_information",
+                "answer": "Need one more page.",
+                "quotes": [],
+            }
+        page = max(kwargs["pages"])
+        return {
+            "status": "ok",
+            "answer": quote,
+            "quotes": [{"text": quote, "page": page}],
+        }
+
+    monkeypatch.setattr("app.agent.loop.draft_answer", _draft)
+    result = run_agent(rec.doc_id, question)
+    searched = [
+        step["args"].get("keyword")
+        for step in result["tool_trace"]
+        if step["tool"] == "search_keyword"
+    ]
+    fetched = [
+        step["args"].get("page_number")
+        for step in result["tool_trace"]
+        if step["tool"] == "get_page"
+    ]
+    assert result["status"] == "ok"
+    assert result["timing"]["planner_llm"] == 0
+    assert calls["n"] == 2
+    assert len(searched) == 2
+    assert len(fetched) >= 2
+    assert result["calls_used"] <= 6
+    assert all(term_allowed(str(kw), extract) for kw in searched)
     clear_active_session()
 
 

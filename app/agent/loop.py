@@ -35,7 +35,8 @@ from app.agent.navigate import (
     optional_search_keeps_repair,
     select_initial_pages,
 )
-from app.agent.pins import extract_question
+from app.agent.pins import extract_question, term_allowed
+from app.agent.schemas import AskResult, Plan
 from app.agent.toc_pick import accept_toc_pick, pick_toc
 from app.agent.verifier import verify_quotes
 from app.config import REQUEST_DEADLINE_SEC
@@ -100,20 +101,22 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
             timing["planner_llm"],
             session.calls_used,
         )
-        return {
-            "text": text,
-            "status": "insufficient_information",
-            "pages_used": sorted(set(pages_used)),
-            "tool_trace": [r.as_dict() for r in session.trace],
-            "calls_used": session.calls_used,
-            "question_id": question_id,
-            "reason": support,
-            "status_reason": status_reason or reason,
-            "intent": intent,
-            "strategy": strategy,
-            "timing": timing,
-            "evidence_cleared": evidence_cleared,
-        }
+        return _pack(
+            {
+                "text": text,
+                "status": "insufficient_information",
+                "pages_used": sorted(set(pages_used)),
+                "tool_trace": [r.as_dict() for r in session.trace],
+                "calls_used": session.calls_used,
+                "question_id": question_id,
+                "reason": support,
+                "status_reason": status_reason or reason,
+                "intent": intent,
+                "strategy": strategy,
+                "timing": timing,
+                "evidence_cleared": evidence_cleared,
+            }
+        )
 
     try:
         if not (question or "").strip():
@@ -153,6 +156,7 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
             keyword_hits,
             searched,
             session,
+            extract,
             wide=wide,
             few_headings=False,
         ):
@@ -186,6 +190,7 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
                 keyword_hits,
                 searched,
                 session,
+                extract,
                 wide=True,
                 few_headings=True,
             ):
@@ -198,6 +203,7 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
                 keyword_hits,
                 searched,
                 session,
+                extract,
                 wide=True,
                 few_headings=True,
             ):
@@ -276,20 +282,22 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
             timing["planner_llm"],
             session.calls_used,
         )
-        return {
-            "text": draft.get("answer") or "",
-            "status": "ok",
-            "pages_used": sorted(set(pages_used)),
-            "tool_trace": [r.as_dict() for r in session.trace],
-            "calls_used": session.calls_used,
-            "question_id": question_id,
-            "quotes": quotes,
-            "evidence_cleared": evidence_cleared,
-            "intent": intent,
-            "strategy": strategy,
-            "status_reason": None,
-            "timing": timing,
-        }
+        return _pack(
+            {
+                "text": draft.get("answer") or "",
+                "status": "ok",
+                "pages_used": sorted(set(pages_used)),
+                "tool_trace": [r.as_dict() for r in session.trace],
+                "calls_used": session.calls_used,
+                "question_id": question_id,
+                "quotes": quotes,
+                "evidence_cleared": evidence_cleared,
+                "intent": intent,
+                "strategy": strategy,
+                "status_reason": None,
+                "timing": timing,
+            }
+        )
     except DeadlineExceededError:
         return _insufficient("request deadline exceeded", status_reason="provider_timeout")
     except Exception as exc:
@@ -310,7 +318,7 @@ def _local_plan(
         "heading_hints": sections.titles[:4],
         "contradiction_sensitive": supersede,
     }
-    return attach_intent(plan, question)
+    return Plan.model_validate(attach_intent(plan, question)).model_dump()
 
 
 def _apply_toc(sections: SectionMatch, chosen: list[dict[str, Any]]) -> SectionMatch:
@@ -339,22 +347,48 @@ def _apply_toc(sections: SectionMatch, chosen: list[dict[str, Any]]) -> SectionM
     return SectionMatch(strong=True, headings=merged, ranges=ranges, starts=starts)
 
 
+def _pack(payload: dict[str, Any]) -> dict[str, Any]:
+    """Fail closed if an ask result does not match the public shape."""
+    try:
+        return AskResult.model_validate(payload).model_dump()
+    except Exception:
+        return {
+            "text": "insufficient information",
+            "status": "insufficient_information",
+            "pages_used": [],
+            "tool_trace": [],
+            "calls_used": int(payload.get("calls_used") or 0),
+            "question_id": str(payload.get("question_id") or ""),
+            "reason": "invalid_output",
+            "status_reason": "invalid_output",
+            "quotes": [],
+            "intent": None,
+            "strategy": None,
+            "timing": None,
+            "evidence_cleared": True,
+        }
+
+
 def _search_pins(
     doc_id: str,
     pins: list[str],
     keyword_hits: dict[str, list[int]],
     searched: set[str],
     session: Any,
+    extract: Any,
     *,
     wide: bool,
     few_headings: bool,
 ) -> bool:
     """Search question pins. False when the wrapper refuses a call.
 
-    The second search runs only when `optional_search_keeps_repair` is true,
-    so it cannot spend the reserved repair get_page.
+    Every keyword is a member of the question extract. The second search runs
+    only when `optional_search_keeps_repair` is true, so a flat outline cannot
+    spend the reserved repair get_page.
     """
     for pin in pins:
+        if not term_allowed(pin, extract):
+            continue
         key = pin.lower()
         if len(searched) >= _MAX_SEARCHES:
             break
@@ -459,4 +493,4 @@ def _accept_draft(
     if ok:
         return quotes, "", ""
     detail = "quote verification failed: " + "; ".join(failures[:3])
-    return None, detail, "invalid_output"
+    return None, detail, "quote_mismatch"
