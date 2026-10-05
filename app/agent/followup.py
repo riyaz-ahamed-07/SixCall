@@ -9,14 +9,22 @@ from app.deadline import clear_deadline, start_deadline
 from app.config import REQUEST_DEADLINE_SEC
 from app.llm.client import get_llm
 
-_FOLLOWUP_CUE = re.compile(
-    r"\b("
-    r"that|this|it|those|these|they|them|above|previous|earlier|same|"
-    r"more|again|clarify|elaborate|expand|explain|meaning|mean|"
-    r"why|how\s+so|what\s+about|and\s+also|continue|go\s+on|"
-    r"in\s+other\s+words|simpler|shorter|longer|which\s+page|"
-    r"can\s+you|could\s+you|please\s+(explain|clarify|repeat)"
-    r")\b",
+# Only pure clarifications of the previous answer. A new question uses tools.
+_PURE_CLARIFY = re.compile(
+    r"^\s*("
+    r"why\??"
+    r"|how\s+so\??"
+    r"|meaning\??"
+    r"|again\??"
+    r"|go\s+on\??"
+    r"|continue\??"
+    r"|in\s+other\s+words\??"
+    r"|(?:simpler|shorter|longer)(?:\s+please)?\??"
+    r"|(?:please\s+)?(?:explain|clarify|elaborate|expand)"
+    r"(?:\s+(?:that|this|it|more|further))+"
+    r"(?:\s+(?:simply|more|further|a\s+bit))?\??"
+    r"|which\s+page(?:\s+\w+){0,6}\??"
+    r")\s*$",
     re.I,
 )
 
@@ -46,8 +54,11 @@ set status to insufficient_information and say a new document lookup is required
 PRIOR_CONTEXT is prior user questions and assistant answers (with any quotes
 already shown). It is conversation memory, not a fresh document read.
 
+status=ok requires quotes copied verbatim from PRIOR_CONTEXT QUOTE lines.
+If the follow-up needs any new document fact, set status to insufficient_information.
+
 JSON only:
-{"status":"ok|insufficient_information","answer":"..."}
+{"status":"ok|insufficient_information","answer":"...","quotes":[{"text":"exact prior quote","page":1}]}
 """
 
 
@@ -77,25 +88,40 @@ def prior_answer_was_insufficient(history: list[dict[str, Any]] | None) -> bool:
 
 
 def is_followup_question(question: str, history: list[dict[str, Any]] | None) -> bool:
-    """True when the user is continuing the prior answer, not starting a fresh lookup."""
+    """True only for a short clarification of the previous answer.
+
+    Normal questions, including ones asked in an existing chat, always take
+    the tool path. Zero-tool replies are not used for a new lookup.
+    """
     if not history:
         return False
     if prior_answer_was_insufficient(history):
         return False
 
     q = (question or "").strip()
-    if not q:
+    if not q or len(q.split()) > 12:
         return False
-
-    # Explicit new document lookups stay on the tool path
-    if _NEW_TOPIC.search(q) and not _FOLLOWUP_CUE.search(q):
+    if _NEW_TOPIC.search(q):
         return False
+    return bool(_PURE_CLARIFY.match(q))
 
-    words = q.split()
-    if len(words) <= 16 and _FOLLOWUP_CUE.search(q):
-        return True
-    # Short questions without anaphoric cues are new lookups (e.g. "how to handle cost").
-    return False
+
+def _prior_quote_pages(history: list[dict[str, Any]]) -> dict[int, str]:
+    pages: dict[int, str] = {}
+    for turn in history:
+        for q in turn.get("quotes") or []:
+            if not isinstance(q, dict):
+                continue
+            text = str(q.get("text") or "").strip()
+            try:
+                page = int(q.get("page"))
+            except (TypeError, ValueError):
+                continue
+            if not text:
+                continue
+            prev = pages.get(page, "")
+            pages[page] = f"{prev}\n{text}".strip() if prev else text
+    return pages
 
 
 def run_followup(
@@ -116,6 +142,7 @@ def run_followup(
         status: str,
         reason: str | None = None,
         status_reason: str | None = None,
+        quotes: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         clear_deadline()
         return {
@@ -127,7 +154,7 @@ def run_followup(
             "question_id": question_id,
             "reason": reason,
             "status_reason": status_reason,
-            "quotes": [],
+            "quotes": list(quotes or []),
             "intent": "followup",
             "strategy": strategy,
         }
@@ -165,9 +192,7 @@ def run_followup(
                 ),
             },
         ]
-        data = get_llm().complete_json(
-            messages, temperature=0.1, light=False, max_attempts=1
-        )
+        data = get_llm().complete_json(messages, temperature=0.1, light=False)
         status = str(data.get("status") or "insufficient_information").lower()
         if status not in {"ok", "insufficient_information"}:
             status = "insufficient_information"
@@ -179,6 +204,23 @@ def run_followup(
                 reason="empty follow-up answer",
                 status_reason="invalid_output",
             )
+        if status == "ok":
+            from app.agent.verifier import verify_quotes
+
+            prior_pages = _prior_quote_pages(history)
+            raw_quotes = [
+                q for q in (data.get("quotes") or []) if isinstance(q, dict)
+            ]
+            ok, failures = verify_quotes(raw_quotes, prior_pages)
+            if not ok:
+                return _done(
+                    text="insufficient information",
+                    status="insufficient_information",
+                    reason="follow-up quote was not in prior evidence: "
+                    + "; ".join(failures[:2]),
+                    status_reason="invalid_output",
+                )
+            return _done(text=answer, status="ok", quotes=raw_quotes)
         if status != "ok":
             detail = answer or "follow-up needs a new document lookup"
             if "follow-up needs a new document lookup" not in detail.lower():
@@ -190,7 +232,6 @@ def run_followup(
                 reason=support or "follow-up needs a new document lookup",
                 status_reason="no_evidence",
             )
-        return _done(text=answer, status="ok")
     except Exception as exc:
         return _done(
             text="insufficient information",

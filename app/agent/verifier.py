@@ -66,13 +66,22 @@ def quote_matches_page(quote: str, page_text: str) -> bool:
 
 
 def verify_quotes(
-    quotes: list[dict[str, Any]], pages: dict[int, str], *, min_chars: int | None = None
+    quotes: list[dict[str, Any]],
+    pages: dict[int, str],
+    *,
+    min_chars: int | None = None,
+    allowed_ids: set[str] | None = None,
 ) -> tuple[bool, list[str]]:
-    """Every quote must be an exact contiguous word-bounded span of a fetched page."""
+    """Accept evidence IDs from fetched pages, else an exact span of page text.
+
+    ID membership is the citation contract: the id must come from spans built
+    for these pages. Free-text quotes still need an exact contiguous span.
+    """
     failures: list[str] = []
     if not quotes:
         return False, ["no quotes provided"]
     floor = MIN_QUOTE_CHARS if min_chars is None else max(1, int(min_chars))
+    allowed = {str(i).upper() for i in allowed_ids} if allowed_ids else None
 
     for q in quotes:
         text = str(q.get("text") or "").strip()
@@ -85,6 +94,9 @@ def verify_quotes(
         source = pages.get(page_i)
         if source is None:
             failures.append(f"quote page {page_i} was not fetched")
+            continue
+        eid = str(q.get("id") or q.get("evidence_id") or "").strip().upper()
+        if allowed is not None and eid and eid in allowed:
             continue
         if not text:
             failures.append("empty quote")

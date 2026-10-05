@@ -115,13 +115,11 @@ def score_pages(
         if len(chosen) >= top_k:
             break
 
-    if contradiction_sensitive and ranked:
-        latest = max(ranked)
-        if latest not in chosen:
-            if len(chosen) >= top_k:
-                chosen[-1] = latest
-            else:
-                chosen.append(latest)
+    if contradiction_sensitive and hit_sets:
+        # Latest keyword hit wins the first slot. Heading scores must not bury it.
+        latest_kw = max(p for pageset in hit_sets.values() for p in pageset)
+        rest = [p for p in chosen if p != latest_kw]
+        chosen = [latest_kw, *rest]
 
     return chosen[:top_k]
 

@@ -72,11 +72,11 @@ flowchart LR
 | **API**         | FastAPI, Uvicorn, python-multipart               | REST: ingest, ask, documents, auth       |
 | **Validation**  | Pydantic v2                                      | Request/response models                  |
 | **Config**      | python-dotenv                                    | `.env` + optional private keys file      |
-| **PDF parse**   | PyMuPDF (`pymupdf`)                              | Page text, TOC/font headings, OCR hooks  |
+| **PDF parse**   | PyMuPDF (`pymupdf`)                              | Page text and TOC/font headings. OCR is off unless `SIXCALL_OCR=1` |
 | **Search**      | Custom inverted index + Snowball stemmer         | Keyword → page numbers (not vectors)     |
-| **NLP helpers** | NLTK (bundled `app/nltk_data`)                   | Planner tokenization / stopwords         |
-| **Quote check** | Exact span after Unicode/whitespace norm         | Verifier rejects paraphrased quotes      |
-| **LLM gateway** | LiteLLM                                          | Groq / Gemini with primary + fallback    |
+| **NLP helpers** | NLTK (bundled `app/nltk_data`, imported on first plan) | Query keywords / stopwords only. Not used during ingest |
+| **Quote check** | Evidence-ID membership, else exact span          | Verifier rejects unknown ids and paraphrases |
+| **LLM gateway** | LiteLLM                                          | Gemini primary, Groq fallback (`LLM_MAX_ATTEMPTS` ≥ 2) |
 | **Database**    | Supabase Postgres via `psycopg`                  | Docs, users, sessions, Q&A, traces       |
 | **Local cache** | `.data/docs`, `.data/traces`                     | Fast local store; dual-write when DB set |
 | **Tests**       | pytest                                           | Budget, verifier, store isolation, NLP   |
@@ -99,13 +99,13 @@ mindmap
     Document layer
       PyMuPDF
       Snowball stemmer
-      NLTK
+      NLTK on first plan
       Inverted index
     Intelligence
       LiteLLM
-      Groq
-      Gemini
-      Quote verifier
+      Gemini primary
+      Groq fallback
+      Evidence-ID verifier
     Data
       Supabase Postgres
       psycopg
@@ -174,7 +174,7 @@ At ingest we build a **keyword inverted map** (`stem → sorted page numbers`) s
 
 ## Agent loop
 
-Per-question flow (budgeted). Follow-ups may skip tools when prior chat evidence is enough.
+Per-question flow (budgeted). The planner is local unless `SIXCALL_LLM_PLANNER=1`, so a normal question is one answer-model call. Only a pure clarification of the previous answer ("why?", "explain that more simply") may skip tools, and only when it recopies a prior quote.
 
 ```mermaid
 sequenceDiagram
@@ -188,7 +188,7 @@ sequenceDiagram
 
   U->>A: ask(doc_id, question)
   A->>T: list_headings (1)
-  A->>P: plan keywords + intent
+  A->>P: local keywords + intent
   P-->>A: keywords, heading_hints
   A->>T: search_keyword ×1–2
   T-->>A: page number lists
@@ -198,7 +198,7 @@ sequenceDiagram
   T-->>A: page text
   A->>Ans: draft with evidence span IDs
   Ans-->>A: answer + quote refs
-  A->>V: exact contiguous span check
+  A->>V: evidence-id or exact span check
   alt quotes OK
     V-->>A: pass
     A-->>U: status=ok + quotes
@@ -211,12 +211,13 @@ sequenceDiagram
 **Steps (typical):**
 
 1. `list_headings` (1 call)
-2. Planner LLM: rewrite + classify + 1–2 keywords
+2. Local planner (no network): keywords, intent, contradiction flag
 3. `search_keyword` ×1–2
-4. Local scorer (no tool): keyword IDF + heading boost
-5. `get_page` for all affordable ranked pages
-6. Answer LLM with verbatim / evidence-ID quotes
-7. Verifier: exact contiguous span (normalized whitespace/Unicode) against fetched pages
+4. Local scorer (no tool): keyword IDF + heading boost. If the question is contradiction-sensitive, `max(keyword hits)` is placed first **before** heading pages are appended
+5. `get_page` for up to 2 pages, or up to 3 for multi / compare / contradiction / howto
+6. One answer call on the **main** model (Gemini, then Groq if that attempt fails)
+7. Verifier: evidence id must be one of the spans from the fetched pages; otherwise the quote must be an exact span
+8. If the draft abstains or verification fails and a call remains, one repair `get_page` and one more answer call
 
 Page text is **untrusted data**. Injection-like lines are flagged; the system prompt answers the **user** question only.
 
@@ -240,7 +241,8 @@ flowchart LR
 
 - Display name = **uploaded filename** (not temp path stem).
 - Same bytes (+ owner) → same `doc_id` (idempotent ingest).
-- OCR path triggers on near-empty / high-garbage pages when available.
+- OCR is **off by default** (`SIXCALL_OCR=0`). Turn it on only for scanned pages; Tesseract is what makes upload feel slow.
+- The CLI sets `SIXCALL_USE_DB=0`, so a demo does not open Postgres. The API still dual-writes when `DATABASE_URL` is set and `SIXCALL_USE_DB` is not `0`.
 
 ---
 
@@ -316,16 +318,31 @@ flowchart LR
 ```mermaid
 flowchart LR
   REQ["complete_json / complete"] --> PRIM{"LLM_PRIMARY"}
-  PRIM -->|groq| G1["Groq main / fast"]
-  PRIM -->|gemini| M1["Gemini main / light"]
-  G1 -->|fallback| M1
-  M1 -->|fallback| G1
-  G1 & M1 --> OUT["JSON plan or answer"]
+  PRIM -->|gemini default| M1["Gemini main"]
+  PRIM -->|groq| G1["Groq main"]
+  M1 -->|attempt 2| G1
+  G1 -->|attempt 2| M1
+  M1 & G1 --> OUT["JSON answer"]
 ```
 
-- Planner uses the **light** model path; answer uses the **main** path.
-- Attempt timeouts and a request deadline (`REQUEST_DEADLINE_SEC`) bound long asks.
+- Keyword planning is **local** (`SIXCALL_LLM_PLANNER=0`). That removes a model round-trip from every question.
+- The final answer uses the **main** model, not the light model, with `LLM_MAX_ATTEMPTS` defaulting to 2 so Groq is a real fallback.
+- `REQUEST_DEADLINE_SEC` defaults to 28 so one slow answer plus one fallback can finish. A successful first call returns immediately and does not wait out the deadline.
 - Total provider failure → `insufficient_information`.
+
+### Latency (measured here, no API keys)
+
+These are structure timings on a 12-page text PDF and a 3-page amendment sample. Provider time is not included.
+
+| Step | Before | After |
+| --- | --- | --- |
+| Import `app.api` | 0.25s (NLTK loaded) | 0.09s (NLTK not loaded yet) |
+| Ingest 12-page text PDF | 0.016s | 0.016s |
+| Sparse one-word page | 0.014s (OCR attempted; Tesseract absent, failed in ~8ms) | 0.001s (OCR not called) |
+| `search_keyword` | 0.01ms | 0.01ms |
+| Ask with the answer model mocked | 0.05s, and the scrubber had already deleted words such as "create" and "ate" | ~0.04s cold, ~0.003s warm. Latest amendment page is in `pages_used` |
+
+The inverted index stays under a millisecond. Upload time grows when OCR runs on every thin page, so OCR is off unless `SIXCALL_OCR=1`. Query time was a planner round-trip plus a light answer call, often cut off by the old 15s deadline. The happy path is local planning plus one main-model answer, and that call returns as soon as it succeeds. Set both `GEMINI_API_KEY` and `GROQ_API_KEY` so the second attempt can run. A live Gemini call still has to fit the demo; this repo cannot time that without keys.
 
 ---
 
@@ -424,15 +441,17 @@ Covered: 7th call blocked · `search_keyword` returns ints · agent does not imp
 
 - **True synonym miss**: PDF says “termination”, query says “halting”
 - **Weak structure**: no TOC + uniform fonts → thin heading hints
-- **OCR gaps**: Tesseract missing or bad scans
+- **OCR gaps**: off by default; scans need `SIXCALL_OCR=1` and Tesseract
 - **Budget**: multi-hop needing many pages under a 6-call cap → abstain
 - **LLM outage**: Gemini↔Groq fallback; total failure → insufficient information
 
 ### Dependencies
 
 ```
-pymupdf, litellm, python-dotenv, pydantic, rapidfuzz, snowballstemmer,
+pymupdf, litellm, python-dotenv, pydantic, snowballstemmer,
 nltk, pytest, fastapi, uvicorn, python-multipart, psycopg
 ```
+
+`rapidfuzz` is not used. Quote checks are evidence-ID membership or an exact span, not fuzzy match.
 
 Query planning uses NLTK `word_tokenize(..., preserve_line=True)` and English stopwords from bundled `app/nltk_data` (no runtime downloads). Technical tokens and meaning-changing words (`not`, `before`, `after`) are preserved. Include `app/nltk_data` when packaging.

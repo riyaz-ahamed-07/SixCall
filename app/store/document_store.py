@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -38,22 +39,20 @@ _INLINE_TOC_RE = re.compile(
     r"\s+\d+(?:\.\d+)+\s+[A-Z?][^\n]{0,60}?\s+\d+(?=\s*\n)"
 )
 _WS_RE = re.compile(r"[ \t]+")
-# Diagonal/stamped PDF watermarks often extract as WATERMARK fragments mid-line.
+# Stamped WATERMARK debris only. Do not split or delete real words that merely
+# contain "ate" (create, update, date, late) or the standalone word "ate".
 _WATERMARK_GLUE_RE = re.compile(
-    r"(?<=[A-Za-z])(?=(?:WATERMARK|WATERMAR|WATERMA|WATERM|ATERMARK|RMARK|ATE)\b)",
-    re.I,
-)
-_WATERMARK_TOKEN_RE = re.compile(
-    r"\b(?:WATERMARK|WATERMAR|WATERMA|WATERM|ATERMARK|RMARK|WATE|ATE|WAT)\b",
-    re.I,
-)
-_WATERMARK_CRUMB_RUN_RE = re.compile(
-    r"(?:\b(?:W|WA|WAT|ATE|TE|RK|K|E)\b[\s,]*){2,}",
+    r"(?<=[A-Za-z])(?=(?:WATERMARK|WATERMAR|WATERMA|WATERM|ATERMARK|RMARK)\b)",
     re.I,
 )
 _WATERMARK_LINE_RE = re.compile(
-    r"^(?:\s*(?:[WwAa]{1,4}|WATERM(?:ARK|A)?|ATERMARK|RMARK|ATE|WAT)\s*)+$"
+    r"^(?:\s*(?:[WwAa]{1,4}|WATERM(?:ARK|A)?|ATERMARK|RMARK)\s*)+$"
 )
+_STAMP_TOKEN_RE = re.compile(
+    r"^(?:WATERMARK|WATERMAR|WATERMA|WATERM|ATERMARK|RMARK)$",
+    re.I,
+)
+_STAMP_CRUMB_RE = re.compile(r"^(?:W|WA|WAT|A|K|E)$", re.I)
 _JUNK_HEADING_RE = re.compile(
     r"^(?:field|value|team|theme|category|document type|product name|problem code|"
     r"a|w|wa|wat|ate|mark|watermark|waterm|atermark|rmark|"
@@ -116,32 +115,35 @@ def tokenize(text: str) -> list[str]:
     return _tokenize_base(text)
 
 
+def _ocr_enabled() -> bool:
+    """OCR is optional and off by default so text PDFs stay a local parse."""
+    return os.getenv("SIXCALL_OCR", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def scrub_watermark_noise(text: str) -> str:
-    """Strip common stamped-watermark fragments that pollute extract/OCR text."""
+    """Strip stamped WATERMARK fragments without deleting ordinary words."""
     if not text:
         return ""
     text = _WATERMARK_GLUE_RE.sub(" ", text)
-    # Repeat a few times for adjacent watermark tokens without nested regex.
-    for _ in range(4):
-        nxt = _WATERMARK_TOKEN_RE.sub(" ", text)
-        if nxt == text:
-            break
-        text = nxt
-    text = _WATERMARK_CRUMB_RUN_RE.sub(" ", text)
     kept: list[str] = []
-    crumb = {"a", "w", "wa", "wat", "ate", "te", "rk", "k", "e"}
     for ln in text.split("\n"):
-        if _WATERMARK_LINE_RE.match(ln.strip()):
+        stripped = ln.strip()
+        if not stripped or _WATERMARK_LINE_RE.match(stripped):
             continue
-        cleaned = _WATERMARK_TOKEN_RE.sub(" ", ln)
-        cleaned = _WATERMARK_CRUMB_RUN_RE.sub(" ", cleaned)
-        cleaned = _WS_RE.sub(" ", cleaned).strip(" ,")
-        if not cleaned:
-            continue
-        words = cleaned.split()
-        if words and sum(1 for w in words if w.lower() in crumb) / len(words) >= 0.6:
-            continue
-        kept.append(cleaned)
+        words = stripped.split()
+        has_stamp = any(_STAMP_TOKEN_RE.match(w.strip(" ,.;:")) for w in words)
+        if has_stamp:
+            kept_words = []
+            for w in words:
+                core = w.strip(" ,.;:")
+                if _STAMP_TOKEN_RE.match(core) or _STAMP_CRUMB_RE.match(core):
+                    continue
+                kept_words.append(w)
+            cleaned = " ".join(kept_words).strip(" ,")
+        else:
+            cleaned = _WS_RE.sub(" ", stripped).strip(" ,")
+        if cleaned:
+            kept.append(cleaned)
     return "\n".join(kept)
 
 
@@ -172,7 +174,7 @@ def _extract_page_text(page: fitz.Page) -> str:
     except TypeError:
         text = page.get_text("text", sort=True) or ""
     text = clean_page_text(text)
-    if needs_ocr(text):
+    if _ocr_enabled() and needs_ocr(text):
         try:
             tp = page.get_textpage_ocr(language="eng", dpi=200, full=False)
             try:
@@ -554,11 +556,19 @@ class DocumentStore:
         self.persist_dir = Path(persist_dir or DOC_STORE_DIR)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
         # Remote DB only for the default app store — never for test temp dirs.
-        self.use_db = (
-            bool(use_db)
-            if use_db is not None
-            else (self.persist_dir.resolve() == Path(DOC_STORE_DIR).resolve())
-        )
+        # SIXCALL_USE_DB=0 keeps the CLI demo on local JSON even if DATABASE_URL is set.
+        if use_db is not None:
+            self.use_db = bool(use_db)
+        else:
+            flag = os.getenv("SIXCALL_USE_DB", "auto").strip().lower()
+            if flag in {"0", "false", "no", "off"}:
+                self.use_db = False
+            elif flag in {"1", "true", "yes", "on"}:
+                self.use_db = True
+            else:
+                self.use_db = (
+                    self.persist_dir.resolve() == Path(DOC_STORE_DIR).resolve()
+                )
         self._docs: dict[str, DocRecord] = {}
         self._load_all()
 

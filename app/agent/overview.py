@@ -296,7 +296,6 @@ def run_light_summary(doc_id: str) -> dict[str, Any]:
             ],
             temperature=0.1,
             light=True,
-            max_attempts=1,
         )
 
         status = str(data.get("status") or "insufficient_information").lower()

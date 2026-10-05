@@ -6,6 +6,39 @@ from app.llm.client import LLMClient, _parse_json
 from app.agent import answerer
 
 
+def test_gemini_primary_falls_back_to_groq():
+    from app.config import LLM_MAX_ATTEMPTS, LLM_PRIMARY, REQUEST_DEADLINE_SEC
+
+    client = LLMClient()
+    client.primary = "gemini"
+    chain = client._model_chain(light=False)
+    assert chain[0].startswith("gemini/")
+    assert any(model.startswith("groq/") for model in chain[1:])
+    assert LLM_MAX_ATTEMPTS >= 2
+    assert LLM_PRIMARY == "gemini"
+    assert REQUEST_DEADLINE_SEC >= 20
+
+
+def test_answer_uses_main_model_not_light_only(monkeypatch):
+    seen = {}
+
+    class _Fake:
+        def complete_json(self, messages, **kwargs):
+            seen.update(kwargs)
+            return {"status": "insufficient_information", "answer": "no", "quotes": []}
+
+    monkeypatch.setattr(answerer, "get_llm", lambda: _Fake())
+    answerer.draft_answer(
+        question="What is Voltix?",
+        plan={},
+        pages={3: "Voltix monitors energy use in legacy factories."},
+        unused_candidates=[],
+        budget_left=2,
+    )
+    assert seen.get("light") is False
+    assert seen.get("max_attempts", 2) != 1
+
+
 def test_json_generation_requests_provider_json_mode_once(monkeypatch):
     calls = []
     def complete(self, messages, **kwargs):

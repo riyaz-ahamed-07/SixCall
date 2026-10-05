@@ -30,6 +30,16 @@ def test_clean_page_text_strips_watermark_fragments():
     assert "Huntrix" in cleaned
 
 
+def test_scrubber_keeps_real_tokens():
+    raw = (
+        "The committee ate lunch and will update the late schedule. "
+        "Please create a date for the water test."
+    )
+    cleaned = clean_page_text(raw).lower()
+    for word in ("ate", "update", "late", "create", "date", "water", "test"):
+        assert word in cleaned
+
+
 def test_filter_headings_drops_watermark_junk():
     from app.store.document_store import Heading, _filter_headings
 
@@ -48,6 +58,20 @@ def test_filter_headings_drops_watermark_junk():
     assert "Field" not in titles
     assert "Value" not in titles
     assert all("WATER" not in t.upper() for t in titles)
+
+
+def test_later_page_is_not_starved_by_early_spans():
+    page1 = " ".join(
+        f"Sentence number {i} discusses shipping policy details." for i in range(30)
+    )
+    pages = {
+        1: page1,
+        2: "The amendment supersedes the prior refund window of thirty days.",
+    }
+    spans = build_evidence_spans(pages)
+    assert any(s["page"] == 2 and "supersedes" in s["text"] for s in spans)
+    page1_count = sum(1 for s in spans if s["page"] == 1)
+    assert page1_count <= 12
 
 
 def test_evidence_ids_resolve_to_exact_verifiable_spans():

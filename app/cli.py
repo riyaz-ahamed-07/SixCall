@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import Any
 
@@ -116,6 +117,8 @@ def _print_trace_pretty(trace: list[dict[str, Any]], question_id: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     _configure_stdout()
+    # Demo CLI reads and writes local .data JSON. Postgres stays opt-in.
+    os.environ.setdefault("SIXCALL_USE_DB", "0")
     from app.api import ask, get_trace, ingest_pdf, list_docs, overview
 
     parser = argparse.ArgumentParser(

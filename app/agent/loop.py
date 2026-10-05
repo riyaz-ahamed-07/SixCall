@@ -22,22 +22,30 @@ from app.tools.wrapper import (
 _BROAD_HIT_CAP = 20
 # Keep enough budget for evidence reads after search.
 _MIN_PAGE_RESERVE = 1
-_MIN_PAGE_RESERVE_CODING = 3
-# Cap page reads — more pages = bigger answer prompt = slower demos.
+_MIN_PAGE_RESERVE_BROAD = 3
+# Simple facts stay at 2 pages. Multi / compare / contradiction / howto use 3.
 _MAX_PAGES_FETCH = 2
-_MAX_PAGES_FETCH_HOWTO = 3
+_MAX_PAGES_FETCH_BROAD = 3
 _MAX_SEARCHES_CODING = 2
 
 
-def _pages_fetch_cap(intent: str | None) -> int:
-    if intent in {"howto", "multi"}:
-        return _MAX_PAGES_FETCH_HOWTO
+def _broad_read(plan: dict[str, Any]) -> bool:
+    return bool(
+        plan.get("contradiction_sensitive")
+        or plan.get("coding")
+        or plan.get("intent") in {"howto", "multi", "compare"}
+    )
+
+
+def _pages_fetch_cap(plan: dict[str, Any]) -> int:
+    if _broad_read(plan):
+        return _MAX_PAGES_FETCH_BROAD
     return _MAX_PAGES_FETCH
 
 
 def _page_reserve(plan: dict[str, Any]) -> int:
-    if plan.get("coding") or plan.get("intent") == "howto":
-        return _MIN_PAGE_RESERVE_CODING
+    if _broad_read(plan):
+        return _MIN_PAGE_RESERVE_BROAD
     return _MIN_PAGE_RESERVE
 
 
@@ -122,6 +130,7 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
                 i > 0
                 and tight
                 and plan.get("intent") not in {"multi", "compare", "howto"}
+                and not plan.get("contradiction_sensitive")
             ):
                 break
             try:
@@ -182,6 +191,10 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
                 ranked = _ensure_coverage(ranked, keyword_hits, top_k)
             strategy = "tree+keyword"
 
+        # Latest keyword hit must occupy a fetch slot before heading pages are added.
+        if plan.get("contradiction_sensitive"):
+            ranked = _force_latest_keyword_page(ranked, keyword_hits)
+
         # Outline section starts — append after keyword ranks so rare hits (e.g. CSV) win.
         tree_boost = _heading_start_pages(headings, plan.get("heading_hints") or [])
         if tree_boost:
@@ -192,7 +205,7 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
         if not ranked:
             return _insufficient("no candidate pages", status_reason="no_evidence")
 
-        fetch_cap = min(session.budget_left, _pages_fetch_cap(plan.get("intent")))
+        fetch_cap = min(session.budget_left, _pages_fetch_cap(plan))
         to_fetch = _expand_neighbor_pages(
             ranked[:fetch_cap],
             ranked,
@@ -218,37 +231,32 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
         if not fetched:
             return _insufficient("no pages fetched", status_reason="no_evidence")
 
-        # ONE final generation — no reserve redraft, no quote-repair LLM.
-        draft = draft_answer(
-            question=question,
-            plan=plan,
-            pages=fetched,
-            unused_candidates=[],
-            budget_left=0,
-        )
-
-        if draft["status"] != "ok":
-            detail = draft.get("error") or draft.get("answer") or "model declined"
-            reason_code = "invalid_output" if draft.get("error") else "no_evidence"
-            return _insufficient(str(detail), status_reason=reason_code)
-
-        if not str(draft.get("answer") or "").strip():
-            return _insufficient("empty answer", status_reason="invalid_output")
-
-        quotes = list(draft.get("quotes") or [])
-        ok, failures = verify_quotes(quotes, fetched)
-        if not ok:
-            from app.agent.evidence import repair_quotes
-
-            repaired = repair_quotes(quotes, fetched)
-            ok2, failures2 = verify_quotes(repaired, fetched)
-            if not ok2:
-                return _insufficient(
-                    "quote verification failed: "
-                    + "; ".join((failures2 or failures)[:3]),
-                    status_reason="invalid_output",
+        draft = _generate(question, plan, fetched, ranked, session.budget_left)
+        quotes, detail, reason_code = _accept_draft(draft, fetched)
+        if quotes is None and session.budget_left >= 1:
+            repair_page = _pick_repair_page(fetched, keyword_hits, ranked)
+            if repair_page is not None:
+                try:
+                    text = get_page(doc_id, repair_page)
+                except BudgetExceededError:
+                    return _insufficient(
+                        "budget exceeded during repair get_page",
+                        status_reason="budget_exhausted",
+                    )
+                except Exception as exc:
+                    return _insufficient(
+                        f"get_page failed: {type(exc).__name__}",
+                        status_reason="unreadable_document",
+                    )
+                fetched[repair_page] = text
+                pages_used.append(repair_page)
+                draft = _generate(
+                    question, plan, fetched, ranked, session.budget_left
                 )
-            quotes = repaired
+                quotes, detail, reason_code = _accept_draft(draft, fetched)
+
+        if quotes is None:
+            return _insufficient(detail or "model declined", status_reason=reason_code)
 
         fetched.clear()
         evidence_cleared = True
@@ -275,6 +283,78 @@ def run_agent(doc_id: str, question: str) -> dict[str, Any]:
         return _insufficient(
             f"agent error: {type(exc).__name__}", status_reason="provider_unavailable"
         )
+
+
+def _generate(
+    question: str,
+    plan: dict[str, Any],
+    fetched: dict[int, str],
+    ranked: list[int],
+    budget_left: int,
+) -> dict[str, Any]:
+    unused = [p for p in ranked if p not in fetched]
+    return draft_answer(
+        question=question,
+        plan=plan,
+        pages=fetched,
+        unused_candidates=unused,
+        budget_left=budget_left,
+    )
+
+
+def _accept_draft(
+    draft: dict[str, Any], pages: dict[int, str]
+) -> tuple[list[dict[str, Any]] | None, str, str]:
+    """Return (quotes, detail, status_reason). quotes is None when not acceptable."""
+    if draft.get("status") != "ok":
+        detail = str(draft.get("error") or draft.get("answer") or "model declined")
+        code = "invalid_output" if draft.get("error") else "no_evidence"
+        return None, detail, code
+    if not str(draft.get("answer") or "").strip():
+        return None, "empty answer", "invalid_output"
+
+    from app.agent.evidence import build_evidence_spans, repair_quotes
+
+    quotes = list(draft.get("quotes") or [])
+    allowed = {str(s["id"]).upper() for s in build_evidence_spans(pages)}
+    ok, failures = verify_quotes(quotes, pages, allowed_ids=allowed)
+    if ok:
+        return quotes, "", ""
+    repaired = repair_quotes(quotes, pages)
+    ok2, failures2 = verify_quotes(repaired, pages, allowed_ids=allowed)
+    if ok2:
+        return repaired, "", ""
+    detail = "quote verification failed: " + "; ".join((failures2 or failures)[:3])
+    return None, detail, "invalid_output"
+
+
+def _force_latest_keyword_page(
+    ranked: list[int], keyword_hits: dict[str, list[int]]
+) -> list[int]:
+    """Put max(keyword hit pages) first, before any heading-page append."""
+    pages = [int(p) for hits in keyword_hits.values() for p in hits]
+    if not pages:
+        return ranked
+    latest = max(pages)
+    return [latest, *[p for p in ranked if p != latest]]
+
+
+def _pick_repair_page(
+    fetched: dict[int, str],
+    keyword_hits: dict[str, list[int]],
+    ranked: list[int],
+) -> int | None:
+    """One extra page when the draft abstains or quotes fail and budget remains."""
+    have = set(fetched)
+    kw_pages = [int(p) for hits in keyword_hits.values() for p in hits]
+    if kw_pages:
+        latest = max(kw_pages)
+        if latest not in have:
+            return latest
+    for page in ranked:
+        if page not in have:
+            return page
+    return None
 
 
 def _ensure_coverage(

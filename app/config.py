@@ -41,14 +41,15 @@ DOC_STORE_DIR = Path(os.getenv("DOC_STORE_DIR", str(_ROOT / ".data" / "docs")))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_CONNECT_TIMEOUT_SEC = float(os.getenv("DB_CONNECT_TIMEOUT_SEC", "5"))
 DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "8000"))
-# End-to-end ask deadline (planner + tools + one final generation).
-REQUEST_DEADLINE_SEC = float(os.getenv("REQUEST_DEADLINE_SEC", "15"))
-LLM_ATTEMPT_TIMEOUT_SEC = float(os.getenv("LLM_ATTEMPT_TIMEOUT_SEC", "12"))
-# Max provider attempts per complete() call (1 = strict judging).
-LLM_MAX_ATTEMPTS = max(1, int(os.getenv("LLM_MAX_ATTEMPTS", "1")))
+# End-to-end ask ceiling. Happy path is one answer call and returns early.
+# 28s leaves room for that call plus one real Groq fallback (attempt timeout × 2).
+REQUEST_DEADLINE_SEC = float(os.getenv("REQUEST_DEADLINE_SEC", "28"))
+LLM_ATTEMPT_TIMEOUT_SEC = float(os.getenv("LLM_ATTEMPT_TIMEOUT_SEC", "10"))
+# Provider attempts per complete() call. Default 2 = primary, then fallback.
+LLM_MAX_ATTEMPTS = max(1, int(os.getenv("LLM_MAX_ATTEMPTS", "2")))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_MODEL_LIGHT = os.getenv("GEMINI_MODEL_LIGHT", "gemini-3.5-flash-lite")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_MODEL_FAST = os.getenv("GROQ_MODEL_FAST", "openai/gpt-oss-20b")
-# Prefer groq while testing / when Gemini is rate-limited. Values: groq | gemini
-LLM_PRIMARY = os.getenv("LLM_PRIMARY", "groq").strip().lower()
+# gemini = Gemini first, Groq fallback. groq = Groq first.
+LLM_PRIMARY = os.getenv("LLM_PRIMARY", "gemini").strip().lower()

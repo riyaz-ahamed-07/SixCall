@@ -50,3 +50,19 @@ def test_scorer_expands_heading_range_for_section():
         top_k=3,
     )
     assert 23 in ranked and 25 in ranked
+
+
+def test_contradiction_puts_latest_keyword_hit_first():
+    headings = [
+        {"title": "Refund policy", "level": 1, "start": 2, "end": 5},
+    ]
+    hits = {"refund": [2, 3, 40], "policy": [2, 6]}
+    ranked = score_pages(
+        keyword_hits=hits,
+        headings=headings,
+        heading_hints=["Refund policy"],
+        contradiction_sensitive=True,
+        top_k=3,
+    )
+    assert ranked[0] == 40
+    assert 40 in ranked[:3]

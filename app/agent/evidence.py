@@ -7,7 +7,9 @@ _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 _MAX_QUOTE_WORDS = 45
 _MAX_CODE_QUOTE_WORDS = 120
 _MIN_SPAN_CHARS = 8
-_MAX_SPANS = 40
+# Per page, so a long early page cannot consume the whole evidence list.
+_MAX_SPANS_PER_PAGE = 12
+_MAX_SPANS = 36
 _SHORT_QUOTE_WORDS = 18
 
 _CODE_LINE_RE = re.compile(
@@ -44,6 +46,7 @@ def build_evidence_spans(pages: dict[int, str]) -> list[dict[str, Any]]:
         text = (pages.get(page) or "").strip()
         if not text:
             continue
+        page_count = 0
         for chunk in _iter_chunks(text):
             chunk = " ".join(chunk.split()).strip()
             if len(chunk) < _MIN_SPAN_CHARS:
@@ -61,8 +64,13 @@ def build_evidence_spans(pages: dict[int, str]) -> list[dict[str, Any]]:
                         "text": piece,
                     }
                 )
-                if len(spans) >= _MAX_SPANS:
-                    return spans
+                page_count += 1
+                if page_count >= _MAX_SPANS_PER_PAGE or len(spans) >= _MAX_SPANS:
+                    break
+            if page_count >= _MAX_SPANS_PER_PAGE or len(spans) >= _MAX_SPANS:
+                break
+        if len(spans) >= _MAX_SPANS:
+            break
     return spans
 
 

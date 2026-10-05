@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
 
@@ -9,9 +10,18 @@ from app.prompts.system import PLANNER_SYSTEM, build_planner_user
 from app.query_nlp import content_words
 
 
+def _llm_planner_enabled() -> bool:
+    """Network planner is off by default: one answer call is the demo path."""
+    return os.getenv("SIXCALL_LLM_PLANNER", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def plan_question(question: str, headings: list[dict[str, Any]]) -> dict[str, Any]:
     # A direct topic question matching a heading needs no network planning.
-    # Comparisons and less explicit requests retain the existing model planner.
     if re.match(r"^\s*(what\s+is|what\s+are|define|explain)\b", question, re.I):
         question_tokens = _content_tokens(question)
         for heading in headings:
@@ -21,16 +31,16 @@ def plan_question(question: str, headings: list[dict[str, Any]]) -> dict[str, An
                 data["keywords"] = [title]
                 data["heading_hints"] = [title]
                 return attach_intent(_normalize_plan(data, question, headings), question)
-    messages = [
-        {"role": "system", "content": PLANNER_SYSTEM},
-        {"role": "user", "content": build_planner_user(question, headings)},
-    ]
-
-    try:
-        data = get_llm().complete_json(
-            messages, temperature=0.1, light=True, max_attempts=1
-        )
-    except Exception:
+    if _llm_planner_enabled():
+        messages = [
+            {"role": "system", "content": PLANNER_SYSTEM},
+            {"role": "user", "content": build_planner_user(question, headings)},
+        ]
+        try:
+            data = get_llm().complete_json(messages, temperature=0.1, light=True)
+        except Exception:
+            data = _heuristic_plan(question, headings)
+    else:
         data = _heuristic_plan(question, headings)
 
     plan = _normalize_plan(data, question, headings)
@@ -235,7 +245,7 @@ def _looks_contradiction_sensitive(question: str) -> bool:
         k in q
         for k in (
             "amend",
-            "supersede",
+            "supersed",
             "latest",
             "updated",
             "instead of",

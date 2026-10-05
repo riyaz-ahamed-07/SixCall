@@ -82,7 +82,7 @@ def ask(
 ) -> Answer:
     """
     Route:
-      follow-up (with history) → no document tools
+      pure clarification of the previous answer → prior quotes only (else tools)
       overview phrasing → overview path
       else → budgeted tree+keyword agent
     """

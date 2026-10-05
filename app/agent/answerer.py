@@ -38,10 +38,8 @@ def draft_answer(
     ]
 
     try:
-        # Judging profile: one provider attempt for the final answer generation.
-        data = get_llm().complete_json(
-            messages, temperature=0.1, light=True, max_attempts=1
-        )
+        # Main model, with the client fallback chain (Gemini, then Groq).
+        data = get_llm().complete_json(messages, temperature=0.1, light=False)
     except Exception as exc:
         logging.getLogger(__name__).warning("answer_generation_failed error=%s", type(exc).__name__)
         return {

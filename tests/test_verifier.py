@@ -26,6 +26,28 @@ def test_quote_verifier_accepts_exact_span():
     assert failures == []
 
 
+def test_evidence_id_membership_accepts_known_id():
+    pages = {1: "The refund window is fourteen days for unused items."}
+    ok, failures = verify_quotes(
+        [{"id": "E1", "text": "not the page text at all", "page": 1}],
+        pages,
+        allowed_ids={"E1"},
+    )
+    assert ok is True
+    assert failures == []
+
+
+def test_unknown_evidence_id_still_needs_exact_span():
+    pages = {1: "The refund window is fourteen days for unused items."}
+    ok, failures = verify_quotes(
+        [{"id": "E99", "text": "Customers may teleport instantly", "page": 1}],
+        pages,
+        allowed_ids={"E1"},
+    )
+    assert ok is False
+    assert failures
+
+
 def test_quote_verifier_rejects_fabricated_quotes():
     pages = {1: "The refund window is fourteen days for unused items."}
     ok, failures = verify_quotes(
