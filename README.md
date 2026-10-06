@@ -72,7 +72,7 @@ flowchart LR
 | **API**         | FastAPI, Uvicorn, python-multipart               | REST: ingest, ask, documents, auth       |
 | **Validation**  | Pydantic v2                                      | Request/response models                  |
 | **Config**      | python-dotenv                                    | `.env` + optional private keys file      |
-| **PDF parse**   | PyMuPDF (`pymupdf`)                              | Page text, TOC/font headings, OCR hooks  |
+| **PDF parse**   | pymupdf4llm + PyMuPDF                            | Markdown page text; TOC/font headings; OCR fallback |
 | **Search**      | Precision phrases + stemmed recall, inside `search_keyword` | Page numbers only                 |
 | **NLP helpers** | NLTK (bundled `app/nltk_data`)                   | Planner tokenization / stopwords         |
 | **Quote check** | Exact span after Unicode/whitespace norm         | Verifier rejects paraphrased quotes      |
@@ -215,7 +215,7 @@ Page text is **untrusted data**. Injection-like lines are flagged; the answer fo
 ```mermaid
 flowchart LR
   PDF["PDF upload"] --> TMP["Temp file"]
-  TMP --> PYM["PyMuPDF extract"]
+  TMP --> PYM["pymupdf4llm page text<br/>PyMuPDF TOC + OCR fallback"]
   PYM --> CLEAN["clean_page_text<br/>TOC strip · dehyphen"]
   CLEAN --> HEAD["Section tree<br/>TOC, fonts, lexical"]
   CLEAN --> IDX["Dual lexical index<br/>precision then recall"]
@@ -422,7 +422,7 @@ Covered: 7th call blocked · `search_keyword` returns ints · agent does not imp
 ### Dependencies
 
 ```
-pymupdf, litellm, python-dotenv, pydantic, rapidfuzz, snowballstemmer,
+pymupdf, pymupdf4llm, litellm, python-dotenv, pydantic, rapidfuzz, snowballstemmer,
 nltk, pytest, fastapi, uvicorn, python-multipart, psycopg
 ```
 

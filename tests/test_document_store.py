@@ -35,6 +35,35 @@ def test_ingest_deterministic_and_idempotent(tmp_path: Path) -> None:
     assert store.get_page(a, 1)
 
 
+def test_ingest_pymupdf4llm_keeps_searchable_text_and_table_digits(tmp_path: Path) -> None:
+    store = reset_store_for_tests(tmp_path / "docs")
+    pdf = tmp_path / "table.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "Refund policy", fontsize=18)
+    page.insert_text((72, 110), "The refund window is 14 days.")
+    data = [["Item", "Days", "Fee"], ["Widget", "14", "3"]]
+    y = 160
+    for row in data:
+        x = 72
+        for cell in row:
+            rect = fitz.Rect(x, y, x + 80, y + 22)
+            page.draw_rect(rect)
+            page.insert_textbox(rect, cell, fontsize=10, align=1)
+            x += 80
+        y += 22
+    doc.save(pdf)
+    doc.close()
+
+    doc_id = store.ingest_pdf(pdf)
+    text = store.get_page(doc_id, 1)
+    assert "refund window" in text.lower()
+    assert "14" in text
+    assert "|" in text
+    assert store.search_keyword(doc_id, "14") == [1]
+    assert 1 in store.search_keyword(doc_id, "refund")
+
+
 def test_get_page_rejects_invalid_and_missing(tmp_path: Path) -> None:
     store = reset_store_for_tests(tmp_path / "docs")
     pdf = tmp_path / "one.pdf"

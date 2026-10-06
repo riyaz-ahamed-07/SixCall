@@ -176,6 +176,65 @@ def _extract_flags() -> int:
     return flags
 
 
+def _markdown_by_page(doc: fitz.Document) -> dict[int, str]:
+    """Markdown page bodies from pymupdf4llm.
+
+    The lightweight writer (layout network off) is the fast extractor: heading
+    marks and pipe tables, without marker-pdf. pypdfium2 would keep plain text
+    only. TOC and font geometry stay on this PyMuPDF document. {} means the
+    caller should use the PyMuPDF text plus OCR path instead.
+    """
+    try:
+        import pymupdf4llm
+
+        pymupdf4llm.use_layout(False)
+        chunks = pymupdf4llm.to_markdown(
+            doc,
+            page_chunks=True,
+            show_progress=False,
+            write_images=False,
+            embed_images=False,
+        )
+    except Exception as exc:
+        logger.warning("pymupdf4llm_failed error=%s", type(exc).__name__)
+        return {}
+
+    out: dict[int, str] = {}
+    if isinstance(chunks, str):
+        if doc.page_count == 1:
+            out[1] = chunks
+        return out
+    if not isinstance(chunks, list):
+        return {}
+    for index, chunk in enumerate(chunks):
+        if isinstance(chunk, str):
+            out[index + 1] = chunk
+            continue
+        if not isinstance(chunk, dict):
+            continue
+        meta = chunk.get("metadata") or {}
+        try:
+            page_no = int(meta.get("page") or (index + 1))
+        except (TypeError, ValueError):
+            page_no = index + 1
+        out[page_no] = str(chunk.get("text") or "")
+    return out
+
+
+def _page_bodies(doc: fitz.Document) -> dict[int, str]:
+    """Prefer pymupdf4llm markdown. Scanned or empty pages use PyMuPDF plus OCR."""
+    markdown = _markdown_by_page(doc)
+    pages: dict[int, str] = {}
+    for index in range(doc.page_count):
+        page_no = index + 1
+        body = clean_page_text(markdown.get(page_no, ""))
+        if body and not needs_ocr(body):
+            pages[page_no] = body
+            continue
+        pages[page_no] = _extract_page_text(doc.load_page(index))
+    return pages
+
+
 def _extract_page_text(page: fitz.Page) -> str:
     flags = _extract_flags()
     try:
@@ -883,14 +942,12 @@ class DocumentStore:
             return doc_id
 
         with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-            pages: dict[int, str] = {}
+            pages = _page_bodies(doc)
             labels: dict[int, str] = {}
             for i in range(doc.page_count):
-                page = doc.load_page(i)
                 page_no = i + 1
-                pages[page_no] = _extract_page_text(page)
                 try:
-                    labels[page_no] = str(page.get_label() or page_no)
+                    labels[page_no] = str(doc.load_page(i).get_label() or page_no)
                 except Exception:
                     labels[page_no] = str(page_no)
 
