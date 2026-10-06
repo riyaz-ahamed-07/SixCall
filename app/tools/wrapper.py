@@ -33,6 +33,7 @@ class ToolCallRecord:
     timestamp: float
     call_index: int
     error: str | None = None
+    elapsed_ms: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -43,6 +44,7 @@ class ToolCallRecord:
             "timestamp": self.timestamp,
             "call_index": self.call_index,
             "error": self.error,
+            "elapsed_ms": round(float(self.elapsed_ms or 0.0), 3),
         }
 
 
@@ -88,24 +90,40 @@ class ToolSession:
             )
 
         self.calls_used = next_index
+        started = time.perf_counter()
         try:
             result = fn(**kwargs)
         except Exception as exc:
+            elapsed_ms = (time.perf_counter() - started) * 1000
             error = f"{type(exc).__name__}: {exc}"
             record = ToolCallRecord(
                 question_id=self.question_id,
                 tool=tool_name,
                 args=kwargs,
-                result_summary=f"ERROR: {error}",
+                result_summary=f"ERROR: {error} budget_left={self.budget_left} elapsed_ms={elapsed_ms:.2f}",
                 timestamp=time.time(),
                 call_index=next_index,
                 error=error,
+                elapsed_ms=elapsed_ms,
             )
             self.trace.append(record)
             _persist_record_safe(record)
+            logger.info(
+                "tool_call qid=%s n=%s tool=%s budget_left=%s elapsed_ms=%.2f error=%s",
+                self.question_id,
+                next_index,
+                tool_name,
+                self.budget_left,
+                elapsed_ms,
+                type(exc).__name__,
+            )
             raise
 
-        summary = _summarize(tool_name, result)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        summary = (
+            f"{_summarize(tool_name, result)} "
+            f"budget_left={self.budget_left} elapsed_ms={elapsed_ms:.2f}"
+        )
         record = ToolCallRecord(
             question_id=self.question_id,
             tool=tool_name,
@@ -114,6 +132,15 @@ class ToolSession:
             timestamp=time.time(),
             call_index=next_index,
             error=None,
+            elapsed_ms=elapsed_ms,
+        )
+        logger.info(
+            "tool_call qid=%s n=%s tool=%s budget_left=%s elapsed_ms=%.2f",
+            self.question_id,
+            next_index,
+            tool_name,
+            self.budget_left,
+            elapsed_ms,
         )
         self.trace.append(record)
         _persist_record_safe(record)

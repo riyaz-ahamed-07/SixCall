@@ -72,8 +72,8 @@ flowchart LR
 | **API**         | FastAPI, Uvicorn, python-multipart               | REST: ingest, ask, documents, auth       |
 | **Validation**  | Pydantic v2                                      | Request/response models                  |
 | **Config**      | python-dotenv                                    | `.env` + optional private keys file      |
-| **PDF parse**   | PyMuPDF (`pymupdf`)                              | Page text, TOC/font headings, OCR hooks  |
-| **Search**      | Custom inverted index + Snowball stemmer         | Keyword → page numbers (not vectors)     |
+| **PDF parse**   | pymupdf4llm + PyMuPDF                            | Markdown page text; TOC/font headings; OCR fallback |
+| **Search**      | Precision phrases + stemmed recall, inside `search_keyword` | Page numbers only                 |
 | **NLP helpers** | NLTK (bundled `app/nltk_data`)                   | Planner tokenization / stopwords         |
 | **Quote check** | Exact span after Unicode/whitespace norm         | Verifier rejects paraphrased quotes      |
 | **LLM gateway** | LiteLLM                                          | Groq / Gemini with primary + fallback    |
@@ -81,7 +81,7 @@ flowchart LR
 | **Local cache** | `.data/docs`, `.data/traces`                     | Fast local store; dual-write when DB set |
 | **Tests**       | pytest                                           | Budget, verifier, store isolation, NLP   |
 
-**Explicitly not used:** embeddings, vector DBs, LangChain / LangGraph / LlamaIndex agent frameworks.
+**Explicitly not used:** agent frameworks (LangChain, LangGraph, LlamaIndex) and external outline APIs. Page selection is the section tree plus the four tools.
 
 ```mermaid
 mindmap
@@ -166,59 +166,47 @@ flowchart TB
 
 `app/tools/wrapper.py` logs every call and **refuses a 7th** tool call for that `question_id`, forcing decline / insufficient information.
 
-### Why keyword inverted lookup ≠ vector search
+### What is unique here
 
-At ingest we build a **keyword inverted map** (`stem → sorted page numbers`) so `search_keyword` can return page hits quickly. That is classic exact/phrase lookup over pages already in the store — not embeddings, not a vector database. Page selection after search uses **classic keyword IDF on the page numbers tools already returned**, plus heading-range boosts.
+The ceiling is a **budget ledger** (six calls, logged, seventh refused). Navigation is a **section tree** from `list_headings`, **question-only pins** (a search term must appear in the question), a **supersede lock** that keeps the latest keyword hit page, and **fail-closed evidence ids** checked without another model call. `search_keyword` still returns page numbers only.
 
 ---
 
 ## Agent loop
 
-Per-question flow (budgeted). Follow-ups may skip tools when prior chat evidence is enough.
+Happy path: **no planner model call**. One answer call after the tools. A weak outline may spend one TOC pick, and only to choose existing heading titles plus terms already in the question. A failed draft may spend one held `get_page` and one more answer. New questions do not answer with zero tools (`SIXCALL_FOLLOWUPS` defaults off).
 
 ```mermaid
 sequenceDiagram
-  participant U as User / UI
+  participant U as User / CLI
   participant A as Agent loop
-  participant P as Planner LLM
   participant T as Tools (≤6)
-  participant S as Local scorer
   participant Ans as Answer LLM
-  participant V as Quote verifier
+  participant V as Span verifier
 
   U->>A: ask(doc_id, question)
-  A->>T: list_headings (1)
-  A->>P: plan keywords + intent
-  P-->>A: keywords, heading_hints
-  A->>T: search_keyword ×1–2
-  T-->>A: page number lists
-  A->>S: score_pages (no tool cost)
-  S-->>A: ranked pages
-  A->>T: get_page ×N (budget left)
+  A->>T: list_headings
+  Note over A: pins copied from the question<br/>heading-title overlap
+  A->>T: search_keyword (precision, else recall)
+  T-->>A: page numbers
+  A->>T: get_page (reserve one repair slot)
   T-->>A: page text
-  A->>Ans: draft with evidence span IDs
-  Ans-->>A: answer + quote refs
-  A->>V: exact contiguous span check
-  alt quotes OK
-    V-->>A: pass
-    A-->>U: status=ok + quotes
-  else fail / no evidence / budget
-    V-->>A: fail
-    A-->>U: insufficient_information
+  Note over A: spans built here, with stable ids
+  A->>Ans: one answer, cite span ids
+  A->>V: id exists, numbers and negations agree
+  alt verified
+    A-->>U: status=ok
+  else repair budget remains
+    A->>T: one more get_page
+    A->>Ans: one more answer
+  else no evidence
+    A-->>U: insufficient information
   end
 ```
 
-**Steps (typical):**
+**Budget:** `1×list_headings + ≤2×search_keyword + ≤3–4×get_page ≤ 6`.
 
-1. `list_headings` (1 call)
-2. Planner LLM: rewrite + classify + 1–2 keywords
-3. `search_keyword` ×1–2
-4. Local scorer (no tool): keyword IDF + heading boost
-5. `get_page` for all affordable ranked pages
-6. Answer LLM with verbatim / evidence-ID quotes
-7. Verifier: exact contiguous span (normalized whitespace/Unicode) against fetched pages
-
-Page text is **untrusted data**. Injection-like lines are flagged; the system prompt answers the **user** question only.
+Page text is **untrusted data**. Injection-like lines are flagged; the answer follows the user question.
 
 ---
 
@@ -227,10 +215,10 @@ Page text is **untrusted data**. Injection-like lines are flagged; the system pr
 ```mermaid
 flowchart LR
   PDF["PDF upload"] --> TMP["Temp file"]
-  TMP --> PYM["PyMuPDF extract"]
+  TMP --> PYM["pymupdf4llm page text<br/>PyMuPDF TOC + OCR fallback"]
   PYM --> CLEAN["clean_page_text<br/>TOC strip · dehyphen"]
-  CLEAN --> HEAD["Headings<br/>TOC or fonts"]
-  CLEAN --> IDX["Inverted index<br/>stem → pages"]
+  CLEAN --> HEAD["Section tree<br/>TOC, fonts, lexical"]
+  CLEAN --> IDX["Dual lexical index<br/>precision then recall"]
   HEAD --> REC["DocRecord"]
   IDX --> REC
   REC --> DISK[".data/docs/*.json"]
@@ -385,11 +373,14 @@ print(get_trace(answer.question_id))
 ### CLI
 
 ```bash
-python -m app.cli ingest path\to\file.pdf
-python -m app.cli ask <doc_id> "What is AI?"
+# Local JSON only (no database required for the demo)
+SIXCALL_USE_DB=0 python -m app.cli ingest path/to/file.pdf
+SIXCALL_USE_DB=0 python -m app.cli ask <doc_id> "What is the refund window?"
+python -m app.cli trace <question_id>
 python -m app.cli docs
-python -m app.cli migrate
 ```
+
+The ask view prints tool milliseconds and answer-model milliseconds separately. `python -m pytest -q` runs the suite, including the multi-page, supersede, absent, injection, repair, and zero-tool cases.
 
 ### HTTP (selected)
 
@@ -431,7 +422,7 @@ Covered: 7th call blocked · `search_keyword` returns ints · agent does not imp
 ### Dependencies
 
 ```
-pymupdf, litellm, python-dotenv, pydantic, rapidfuzz, snowballstemmer,
+pymupdf, pymupdf4llm, litellm, python-dotenv, pydantic, rapidfuzz, snowballstemmer,
 nltk, pytest, fastapi, uvicorn, python-multipart, psycopg
 ```
 

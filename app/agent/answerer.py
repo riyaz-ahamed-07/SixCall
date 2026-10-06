@@ -3,8 +3,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from pydantic import ValidationError
+
 from app.agent.evidence import build_evidence_spans, resolve_quote_refs
 from app.agent.intent import is_coding_question
+from app.agent.schemas import AnswerDraft
 from app.llm.client import get_llm
 from app.prompts.system import ANSWER_SYSTEM, CODING_ANSWER_SYSTEM, build_answer_user
 
@@ -51,13 +54,22 @@ def draft_answer(
             "error": "Could not generate a valid answer. Please try the question again.",
         }
 
-    status = str(data.get("status") or "insufficient_information").lower()
-    if status not in {"ok", "insufficient_information"}:
-        status = "insufficient_information"
+    try:
+        parsed = AnswerDraft.model_validate(data)
+    except (ValidationError, TypeError, ValueError):
+        return {
+            "status": "insufficient_information",
+            "answer": "insufficient information",
+            "quotes": [],
+            "error": "invalid_output",
+        }
 
-    quotes = resolve_quote_refs(data.get("quotes") or [], spans_by_id, pages)
-
-    answer = str(data.get("answer") or "").strip()
+    status = parsed.status
+    quotes = resolve_quote_refs(
+        [quote.model_dump() for quote in parsed.quotes],
+        spans_by_id,
+    )
+    answer = parsed.answer.strip()
 
     # status=ok requires a nonempty answer AND at least one quote.
     if status == "ok":
@@ -76,15 +88,8 @@ def draft_answer(
                 "error": "missing_quotes",
             }
 
-    if status == "insufficient_information":
-        # Keep explanatory prose only — the agent loop adds the label once.
-        if not answer or answer.lower() == "insufficient information":
-            answer = "insufficient information"
-        elif answer.lower().startswith("insufficient information"):
-            from app.agent.abstain import strip_abstain_label
-
-            rest = strip_abstain_label(answer)
-            answer = rest or "insufficient information"
+    if status == "insufficient_information" and not answer:
+        answer = "insufficient information"
 
     return {
         "status": status,

@@ -1,15 +1,29 @@
+"""Evidence spans are built only after get_page, never during ingest.
+
+Ids are stable for a given set of fetched pages: pages are walked in order
+and each page gets at most 8 spans so a long early page cannot use every id.
+Prose becomes sentence spans. A table row stays one span, digits included.
+A code line stays one span, camelCase included.
+"""
+
 from __future__ import annotations
 
 import re
 from typing import Any
 
+from app.agent.schemas import EvidenceSpan
+from app.agent.verifier import fragment_of_span, near_span
+
 _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 _MAX_QUOTE_WORDS = 45
 _MAX_CODE_QUOTE_WORDS = 120
 _MIN_SPAN_CHARS = 8
-_MAX_SPANS = 40
+_MAX_SPANS_PER_PAGE = 8
+_MAX_SPANS = 32
+_SNAP_MIN = 90
 _SHORT_QUOTE_WORDS = 18
 
+_TABLE_SPLIT_RE = re.compile(r"\S(?: {2,}|\t)\S(?: {2,}|\t)\S")
 _CODE_LINE_RE = re.compile(
     r"(^\s{2,})"
     r"|[{};#]"
@@ -37,33 +51,89 @@ def looks_like_code(text: str) -> bool:
     return False
 
 
+def looks_like_table_row(text: str) -> bool:
+    line = text or ""
+    if "\t" in line or line.count("|") >= 1:
+        return True
+    return bool(_TABLE_SPLIT_RE.search(line))
+
+
+def span_genre(text: str, kind: str | None = None) -> str:
+    """Label a span so the answer call can prefer the right kind of line."""
+    if kind == "table":
+        return "table"
+    if kind == "code":
+        return "code"
+    if looks_like_table_row(text):
+        return "table"
+    if looks_like_code(text):
+        return "code"
+    low = (text or "").lower()
+    if any(k in low for k in ("supersed", "amend", "replaces", "replaced by", "in lieu")):
+        return "amendment"
+    if re.search(r"\b(is defined|defined as|means|refers to|definition of)\b", low):
+        return "definition"
+    if re.search(r"\b(step\s+\d|procedure|shall|must)\b", low):
+        return "procedure"
+    if re.search(r"\d", text or ""):
+        return "quantity"
+    return "prose"
+
+
 def build_evidence_spans(pages: dict[int, str]) -> list[dict[str, Any]]:
-    """Derive exact citable spans from fetched pages (no extra tool cost)."""
+    """Citable spans from pages already fetched. No tool cost and no model call."""
     spans: list[dict[str, Any]] = []
     for page in sorted(pages):
         text = (pages.get(page) or "").strip()
         if not text:
             continue
-        for chunk in _iter_chunks(text):
+        page_count = 0
+        for kind, chunk in _iter_chunks(text):
+            # Collapse runs of space. camelCase and digits stay as written.
             chunk = " ".join(chunk.split()).strip()
-            if len(chunk) < _MIN_SPAN_CHARS:
+            floor = 1 if kind in {"table", "code"} else _MIN_SPAN_CHARS
+            if len(chunk) < floor:
                 continue
-            max_words = (
-                _MAX_CODE_QUOTE_WORDS if looks_like_code(chunk) else _MAX_QUOTE_WORDS
-            )
-            for piece in _chunk_words(chunk, max_words):
-                if len(piece) < _MIN_SPAN_CHARS:
+            max_words = _MAX_CODE_QUOTE_WORDS if kind == "code" else _MAX_QUOTE_WORDS
+            pieces = [chunk] if kind in {"table", "code"} else _chunk_words(chunk, max_words)
+            for piece in pieces:
+                if len(piece) < floor:
                     continue
-                spans.append(
-                    {
-                        "id": f"E{len(spans) + 1}",
-                        "page": int(page),
-                        "text": piece,
-                    }
-                )
-                if len(spans) >= _MAX_SPANS:
-                    return spans
+                try:
+                    span = EvidenceSpan(
+                        id=f"E{len(spans) + 1}",
+                        page=int(page),
+                        text=piece,
+                        genre=span_genre(piece, kind),
+                    )
+                except Exception:
+                    continue
+                spans.append(span.model_dump())
+                page_count += 1
+                if page_count >= _MAX_SPANS_PER_PAGE or len(spans) >= _MAX_SPANS:
+                    break
+            if page_count >= _MAX_SPANS_PER_PAGE or len(spans) >= _MAX_SPANS:
+                break
+        if len(spans) >= _MAX_SPANS:
+            break
     return spans
+
+
+def _snap_to_span(
+    text: str,
+    page: int,
+    spans_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    if len(" ".join((text or "").split())) < _MIN_SPAN_CHARS:
+        return None
+    on_page = [s for s in spans_by_id.values() if int(s.get("page") or 0) == page]
+    containing = [s for s in on_page if fragment_of_span(text, str(s.get("text") or ""))]
+    if containing:
+        return min(containing, key=lambda s: len(str(s.get("text") or "")))
+    close = [s for s in on_page if near_span(text, str(s.get("text") or ""), minimum=_SNAP_MIN)]
+    if not close:
+        return None
+    return min(close, key=lambda s: len(str(s.get("text") or "")))
 
 
 def resolve_quote_refs(
@@ -71,29 +141,94 @@ def resolve_quote_refs(
     spans_by_id: dict[str, dict[str, Any]],
     pages: dict[int, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Map model quote objects to exact {page, text} using evidence ids when present."""
+    """Keep known span ids. Unknown ids are dropped. Free text must snap to a span."""
+    del pages
     quotes: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for q in quotes_raw:
         if not isinstance(q, dict):
             continue
         eid = str(q.get("id") or q.get("evidence_id") or "").strip().upper()
-        if eid and eid in spans_by_id:
-            span = spans_by_id[eid]
-            quotes.append({"text": span["text"], "page": span["page"], "id": eid})
+        if eid:
+            span = spans_by_id.get(eid)
+            if span is None or eid in seen:
+                continue
+            seen.add(eid)
+            quotes.append({"text": span["text"], "page": int(span["page"]), "id": eid})
             continue
         text = str(q.get("text") or "").strip()
         try:
             page = int(q.get("page"))
         except (TypeError, ValueError):
             continue
-        if text:
-            item: dict[str, Any] = {"text": text, "page": page}
-            if eid:
-                item["id"] = eid
-            quotes.append(item)
-    if pages:
-        quotes = extend_quotes(quotes, pages)
+        span = _snap_to_span(text, page, spans_by_id)
+        if span is None:
+            continue
+        sid = str(span["id"]).upper()
+        if sid in seen:
+            continue
+        seen.add(sid)
+        quotes.append({"text": span["text"], "page": int(span["page"]), "id": sid})
     return quotes
+
+
+def _line_kind(line: str) -> str:
+    raw = line or ""
+    if not raw.strip():
+        return "blank"
+    if "\t" in raw or raw.count("|") >= 1:
+        return "table"
+    if looks_like_code(raw):
+        return "code"
+    if _TABLE_SPLIT_RE.search(raw):
+        return "table"
+    return "prose"
+
+
+def _iter_chunks(text: str) -> list[tuple[str, str]]:
+    """(kind, text) pairs. Kind is prose, table, or code. No ingest text is read."""
+    out: list[tuple[str, str]] = []
+    prose_buf: list[str] = []
+
+    def flush_prose() -> None:
+        if not prose_buf:
+            return
+        block = "\n".join(prose_buf)
+        prose_buf.clear()
+        for chunk in _SENT_SPLIT_RE.split(block):
+            c = chunk.strip()
+            if c:
+                out.append(("prose", c))
+
+    for line in text.splitlines():
+        raw = line.rstrip()
+        kind = _line_kind(raw)
+        if kind == "blank":
+            flush_prose()
+            continue
+        if kind == "prose":
+            prose_buf.append(raw)
+            continue
+        flush_prose()
+        stripped = raw.strip()
+        if stripped:
+            out.append((kind, stripped))
+    flush_prose()
+    if not out and text.strip():
+        out.extend(("prose", c.strip()) for c in _SENT_SPLIT_RE.split(text) if c.strip())
+    return out
+
+
+def _chunk_words(text: str, max_words: int) -> list[str]:
+    words = text.split()
+    if len(words) <= max_words:
+        return [text]
+    out: list[str] = []
+    for i in range(0, len(words), max_words):
+        piece = " ".join(words[i : i + max_words]).strip()
+        if piece:
+            out.append(piece)
+    return out
 
 
 def extend_quotes(
@@ -132,7 +267,6 @@ def _expand_to_sentence(needle: str, page_text: str) -> str | None:
     n = _norm_for_match(needle)
     if not n:
         return None
-    # Prefer intact lines for code-ish pages; else sentence units.
     candidates = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
     candidates.extend(
         c.strip() for c in _SENT_SPLIT_RE.split(page_text) if c and c.strip()
@@ -150,12 +284,8 @@ def _expand_to_sentence(needle: str, page_text: str) -> str | None:
             _MAX_CODE_QUOTE_WORDS if looks_like_code(cand) else _MAX_QUOTE_WORDS
         )
         if len(words) > max_w:
-            # Keep a window around the needle inside the long sentence.
-            idx = c_norm.find(n)
-            # Approximate by word overlap rather than char index on norm text.
             piece = " ".join(words[:max_w])
             if _norm_for_match(needle) not in _norm_for_match(piece):
-                # Center window on first matching word of needle.
                 n_words = needle.split()
                 start = 0
                 for i, w in enumerate(words):
@@ -175,10 +305,7 @@ def repair_quotes(
     quotes: list[dict[str, Any]],
     pages: dict[int, str],
 ) -> list[dict[str, Any]]:
-    """Replace unverifiable free-text quotes with overlapping evidence spans.
-
-    Keeps the answer path alive for code/solution pages without inventing text.
-    """
+    """Replace unverifiable free-text quotes with overlapping evidence spans."""
     from app.agent.verifier import quote_matches_page
 
     spans = build_evidence_spans(pages)
@@ -196,12 +323,16 @@ def repair_quotes(
         if source is None:
             continue
         if text and quote_matches_page(text, source):
-            repaired.append({"text": text, "page": page, **({"id": q["id"]} if q.get("id") else {})})
+            repaired.append(
+                {"text": text, "page": page, **({"id": q["id"]} if q.get("id") else {})}
+            )
             continue
         page_spans = [s for s in spans if int(s["page"]) == page]
         best = _best_overlap_span(text, page_spans)
         if best is None and looks_like_code(text):
-            code_spans = [s for s in page_spans if looks_like_code(str(s.get("text") or ""))]
+            code_spans = [
+                s for s in page_spans if looks_like_code(str(s.get("text") or ""))
+            ]
             best = code_spans[0] if code_spans else None
         if best is not None:
             repaired.append(
@@ -211,7 +342,6 @@ def repair_quotes(
     if repaired:
         return repaired
 
-    # Only fall back to code spans when the model was clearly citing code.
     if not any(looks_like_code(str(q.get("text") or "")) for q in (quotes or [])):
         return []
     codeish = [s for s in spans if looks_like_code(str(s.get("text") or ""))]
@@ -239,7 +369,6 @@ def _best_overlap_span(
                 best = s
                 best_score = score
                 continue
-        # Token overlap for lightly paraphrased code comments / prompts.
         n_toks = set(n.split())
         t_toks = set(t.split())
         if len(n_toks) < 2:
@@ -249,45 +378,3 @@ def _best_overlap_span(
             best = s
             best_score = overlap
     return best
-
-
-def _iter_chunks(text: str) -> list[str]:
-    """Prefer intact code lines; sentence-split prose only."""
-    out: list[str] = []
-    prose_buf: list[str] = []
-
-    def flush_prose() -> None:
-        if not prose_buf:
-            return
-        block = "\n".join(prose_buf)
-        prose_buf.clear()
-        for chunk in _SENT_SPLIT_RE.split(block):
-            c = chunk.strip()
-            if c:
-                out.append(c)
-
-    for line in text.splitlines():
-        raw = line.rstrip()
-        if looks_like_code(raw):
-            flush_prose()
-            stripped = raw.strip()
-            if stripped:
-                out.append(stripped)
-        else:
-            prose_buf.append(raw)
-    flush_prose()
-    if not out and text.strip():
-        out.extend(c.strip() for c in _SENT_SPLIT_RE.split(text) if c.strip())
-    return out
-
-
-def _chunk_words(text: str, max_words: int) -> list[str]:
-    words = text.split()
-    if len(words) <= max_words:
-        return [text]
-    out: list[str] = []
-    for i in range(0, len(words), max_words):
-        piece = " ".join(words[i : i + max_words]).strip()
-        if piece:
-            out.append(piece)
-    return out

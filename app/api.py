@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -27,6 +28,7 @@ class Answer(BaseModel):
     quotes: list[dict[str, Any]] = Field(default_factory=list)
     intent: str | None = None
     strategy: str | None = None
+    timing: dict[str, Any] | None = None
 
 
 def ingest_pdf(path: str, *, owner_id: str | None = None, source_name: str | None = None) -> str:
@@ -47,6 +49,7 @@ def _to_answer(result: dict[str, Any]) -> Answer:
         quotes=list(result.get("quotes") or []),
         intent=result.get("intent"),
         strategy=result.get("strategy"),
+        timing=result.get("timing"),
     )
 
 
@@ -73,6 +76,11 @@ def _persist_answer(
         logging.getLogger(__name__).warning("answer_db_persist_failed qid=%s error=%s", answer.question_id, type(exc).__name__)
 
 
+def _followups_enabled() -> bool:
+    """Chat-memory answers stay off unless SIXCALL_FOLLOWUPS=1."""
+    return os.getenv("SIXCALL_FOLLOWUPS", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def ask(
     doc_id: str,
     question: str,
@@ -82,19 +90,27 @@ def ask(
 ) -> Answer:
     """
     Route:
-      follow-up (with history) → no document tools
-      overview phrasing → overview path
-      else → budgeted tree+keyword agent
+      SIXCALL_FOLLOWUPS=1 and a pure clarification → prior quotes, else tools
+      overview phrasing → heading sample via get_page
+      else → budgeted structure-first agent
+
+    A live ask that still has zero tool calls is sent through the agent.
+    Follow-ups that need evidence cannot answer from memory alone.
     """
     hist = list(history or [])
-    if is_followup_question(question, hist) and not prior_answer_was_insufficient(hist):
+    if (
+        _followups_enabled()
+        and is_followup_question(question, hist)
+        and not prior_answer_was_insufficient(hist)
+    ):
         result = run_followup(doc_id, question, hist)
-        # If memory alone can't answer, reopen the document with tools.
-        if result.get("status") != "ok":
+        if result.get("status") != "ok" or int(result.get("calls_used") or 0) <= 0:
             result = run_agent(doc_id, question)
     elif is_overview_question(question):
         result = run_overview(doc_id, question)
     else:
+        result = run_agent(doc_id, question)
+    if int(result.get("calls_used") or 0) <= 0 and (question or "").strip():
         result = run_agent(doc_id, question)
     answer = _to_answer(result)
     _persist_answer(doc_id, question, answer, owner_id=owner_id)

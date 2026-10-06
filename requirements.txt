@@ -1,4 +1,6 @@
-pymupdf>=1.24.0
+# pymupdf4llm 1.28.x imports only when this PyMuPDF version matches.
+pymupdf==1.28.2
+pymupdf4llm==1.28.2
 python-dotenv>=1.0.0
 litellm>=1.60.0
 pydantic>=2.0.0

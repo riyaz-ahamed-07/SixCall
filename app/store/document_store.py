@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -13,6 +14,8 @@ from typing import Any
 import pymupdf as fitz
 
 from app.config import DOC_STORE_DIR
+from app.index.dual_index import build_precision_index, precision_lookup
+from app.store.section_tree import lexical_heading_candidates
 from app.textutil import (
     collapse_ws,
     keyword_aliases,
@@ -38,22 +41,21 @@ _INLINE_TOC_RE = re.compile(
     r"\s+\d+(?:\.\d+)+\s+[A-Z?][^\n]{0,60}?\s+\d+(?=\s*\n)"
 )
 _WS_RE = re.compile(r"[ \t]+")
-# Diagonal/stamped PDF watermarks often extract as WATERMARK fragments mid-line.
+# Stamped WATERMARK debris only. Do not split or delete real words that merely
+# contain "ate" (create, update, date, late) or the standalone word "ate".
 _WATERMARK_GLUE_RE = re.compile(
-    r"(?<=[A-Za-z])(?=(?:WATERMARK|WATERMAR|WATERMA|WATERM|ATERMARK|RMARK|ATE)\b)",
+    r"(?<=[A-Za-z])(?=(?:WATERMARK|WATERMAR|WATERMA|WATERM|ATERMARK|RMARK)\b)",
     re.I,
 )
-_WATERMARK_TOKEN_RE = re.compile(
-    r"\b(?:WATERMARK|WATERMAR|WATERMA|WATERM|ATERMARK|RMARK|WATE|ATE|WAT)\b",
+_WATERMARK_CRUMB_RE = re.compile(
+    r"^(?:[WwAa]{1,4}|WATERM(?:ARK|A)?|ATERMARK|RMARK)$",
     re.I,
 )
-_WATERMARK_CRUMB_RUN_RE = re.compile(
-    r"(?:\b(?:W|WA|WAT|ATE|TE|RK|K|E)\b[\s,]*){2,}",
+_STAMP_TOKEN_RE = re.compile(
+    r"^(?:WATERMARK|WATERMAR|WATERMA|WATERM|ATERMARK|RMARK)$",
     re.I,
 )
-_WATERMARK_LINE_RE = re.compile(
-    r"^(?:\s*(?:[WwAa]{1,4}|WATERM(?:ARK|A)?|ATERMARK|RMARK|ATE|WAT)\s*)+$"
-)
+_STAMP_CRUMB_RE = re.compile(r"^(?:W|WA|WAT|A|K|E)$", re.I)
 _JUNK_HEADING_RE = re.compile(
     r"^(?:field|value|team|theme|category|document type|product name|problem code|"
     r"a|w|wa|wat|ate|mark|watermark|waterm|atermark|rmark|"
@@ -116,32 +118,41 @@ def tokenize(text: str) -> list[str]:
     return _tokenize_base(text)
 
 
+def _is_watermark_crumb_line(stripped: str) -> bool:
+    """Drop a line only when every token is stamp debris and there are at least two.
+
+    A lone ``A`` (or any single content token) is kept.
+    """
+    tokens = [t.strip(" ,.;:") for t in stripped.split() if t.strip(" ,.;:")]
+    if len(tokens) < 2:
+        return False
+    return all(_WATERMARK_CRUMB_RE.match(t) for t in tokens)
+
+
 def scrub_watermark_noise(text: str) -> str:
-    """Strip common stamped-watermark fragments that pollute extract/OCR text."""
+    """Strip stamped WATERMARK fragments without deleting ordinary words."""
     if not text:
         return ""
     text = _WATERMARK_GLUE_RE.sub(" ", text)
-    # Repeat a few times for adjacent watermark tokens without nested regex.
-    for _ in range(4):
-        nxt = _WATERMARK_TOKEN_RE.sub(" ", text)
-        if nxt == text:
-            break
-        text = nxt
-    text = _WATERMARK_CRUMB_RUN_RE.sub(" ", text)
     kept: list[str] = []
-    crumb = {"a", "w", "wa", "wat", "ate", "te", "rk", "k", "e"}
     for ln in text.split("\n"):
-        if _WATERMARK_LINE_RE.match(ln.strip()):
+        stripped = ln.strip()
+        if not stripped or _is_watermark_crumb_line(stripped):
             continue
-        cleaned = _WATERMARK_TOKEN_RE.sub(" ", ln)
-        cleaned = _WATERMARK_CRUMB_RUN_RE.sub(" ", cleaned)
-        cleaned = _WS_RE.sub(" ", cleaned).strip(" ,")
-        if not cleaned:
-            continue
-        words = cleaned.split()
-        if words and sum(1 for w in words if w.lower() in crumb) / len(words) >= 0.6:
-            continue
-        kept.append(cleaned)
+        words = stripped.split()
+        has_stamp = any(_STAMP_TOKEN_RE.match(w.strip(" ,.;:")) for w in words)
+        if has_stamp:
+            kept_words = []
+            for w in words:
+                core = w.strip(" ,.;:")
+                if _STAMP_TOKEN_RE.match(core) or _STAMP_CRUMB_RE.match(core):
+                    continue
+                kept_words.append(w)
+            cleaned = " ".join(kept_words).strip(" ,")
+        else:
+            cleaned = _WS_RE.sub(" ", stripped).strip(" ,")
+        if cleaned:
+            kept.append(cleaned)
     return "\n".join(kept)
 
 
@@ -163,6 +174,65 @@ def _extract_flags() -> int:
     if dehyp:
         flags |= dehyp
     return flags
+
+
+def _markdown_by_page(doc: fitz.Document) -> dict[int, str]:
+    """Markdown page bodies from pymupdf4llm.
+
+    The lightweight writer (layout network off) is the fast extractor: heading
+    marks and pipe tables, without marker-pdf. pypdfium2 would keep plain text
+    only. TOC and font geometry stay on this PyMuPDF document. {} means the
+    caller should use the PyMuPDF text plus OCR path instead.
+    """
+    try:
+        import pymupdf4llm
+
+        pymupdf4llm.use_layout(False)
+        chunks = pymupdf4llm.to_markdown(
+            doc,
+            page_chunks=True,
+            show_progress=False,
+            write_images=False,
+            embed_images=False,
+        )
+    except Exception as exc:
+        logger.warning("pymupdf4llm_failed error=%s", type(exc).__name__)
+        return {}
+
+    out: dict[int, str] = {}
+    if isinstance(chunks, str):
+        if doc.page_count == 1:
+            out[1] = chunks
+        return out
+    if not isinstance(chunks, list):
+        return {}
+    for index, chunk in enumerate(chunks):
+        if isinstance(chunk, str):
+            out[index + 1] = chunk
+            continue
+        if not isinstance(chunk, dict):
+            continue
+        meta = chunk.get("metadata") or {}
+        try:
+            page_no = int(meta.get("page") or (index + 1))
+        except (TypeError, ValueError):
+            page_no = index + 1
+        out[page_no] = str(chunk.get("text") or "")
+    return out
+
+
+def _page_bodies(doc: fitz.Document) -> dict[int, str]:
+    """Prefer pymupdf4llm markdown. Scanned or empty pages use PyMuPDF plus OCR."""
+    markdown = _markdown_by_page(doc)
+    pages: dict[int, str] = {}
+    for index in range(doc.page_count):
+        page_no = index + 1
+        body = clean_page_text(markdown.get(page_no, ""))
+        if body and not needs_ocr(body):
+            pages[page_no] = body
+            continue
+        pages[page_no] = _extract_page_text(doc.load_page(index))
+    return pages
 
 
 def _extract_page_text(page: fitz.Page) -> str:
@@ -205,6 +275,7 @@ class DocRecord:
     labels: dict[int, str]
     headings: list[Heading] = field(default_factory=list)
     index: dict[str, list[int]] = field(default_factory=dict)
+    precision_index: dict[str, list[int]] = field(default_factory=dict)
 
     def to_jsonable(self) -> dict[str, Any]:
         return {
@@ -214,6 +285,7 @@ class DocRecord:
             "labels": {str(k): v for k, v in self.labels.items()},
             "headings": [asdict(h) for h in self.headings],
             "index": self.index,
+            "precision_index": self.precision_index,
         }
 
     @classmethod
@@ -225,6 +297,7 @@ class DocRecord:
             labels={int(k): v for k, v in data["labels"].items()},
             headings=[Heading(**h) for h in data.get("headings", [])],
             index={k: list(v) for k, v in data.get("index", {}).items()},
+            precision_index={k: list(v) for k, v in data.get("precision_index", {}).items()},
         )
 
 
@@ -474,6 +547,30 @@ def _headings_from_fonts(doc: fitz.Document) -> list[Heading]:
     return _filter_headings(headings, page_count=doc.page_count)
 
 
+def _build_section_tree(
+    doc: fitz.Document, pages: dict[int, str]
+) -> tuple[list[Heading], str]:
+    """TOC, then font size, then lexical heading lines."""
+    page_count = doc.page_count
+    toc_heads = _headings_from_toc(doc, page_count)
+    if _headings_usable(toc_heads, page_count):
+        return toc_heads, "toc"
+    font_heads = _headings_from_fonts(doc)
+    if _headings_usable(font_heads, page_count):
+        return font_heads, "font"
+    raw = lexical_heading_candidates(pages)
+    lexical = _filter_headings(
+        _headings_with_hierarchy(raw, page_count), page_count=page_count
+    )
+    if lexical:
+        return lexical, "lexical"
+    if font_heads:
+        return _filter_headings(font_heads, page_count=page_count), "font"
+    if toc_heads:
+        return _filter_headings(toc_heads, page_count=page_count), "toc"
+    return [], "none"
+
+
 def build_inverted_index(pages: dict[int, str]) -> dict[str, list[int]]:
     index: dict[str, set[int]] = defaultdict(set)
     for page_no, text in pages.items():
@@ -554,11 +651,17 @@ class DocumentStore:
         self.persist_dir = Path(persist_dir or DOC_STORE_DIR)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
         # Remote DB only for the default app store — never for test temp dirs.
-        self.use_db = (
-            bool(use_db)
-            if use_db is not None
-            else (self.persist_dir.resolve() == Path(DOC_STORE_DIR).resolve())
-        )
+        # SIXCALL_USE_DB=0 keeps the CLI demo on local JSON even if DATABASE_URL is set.
+        if use_db is not None:
+            self.use_db = bool(use_db)
+        else:
+            flag = os.getenv("SIXCALL_USE_DB", "auto").strip().lower()
+            if flag in {"0", "false", "no", "off"}:
+                self.use_db = False
+            elif flag in {"1", "true", "yes", "on"}:
+                self.use_db = True
+            else:
+                self.use_db = self.persist_dir.resolve() == Path(DOC_STORE_DIR).resolve()
         self._docs: dict[str, DocRecord] = {}
         self._load_all()
 
@@ -598,6 +701,7 @@ class DocumentStore:
             page_count=page_count,
         )
         rec.index = build_inverted_index(rec.pages)
+        rec.precision_index = build_precision_index(rec.pages)
         after_chars = sum(len(t or "") for t in rec.pages.values())
         changed = len(rec.headings) != before_h or after_chars != before_chars
         return rec, changed
@@ -773,8 +877,18 @@ class DocumentStore:
         if not keyword:
             return []
 
+        aliases = keyword_aliases(keyword)
+        precise: set[int] = set()
+        for alias in aliases:
+            hit = precision_lookup(rec.precision_index, alias)
+            if hit:
+                precise.update(int(p) for p in hit)
+        if precise:
+            # Precision named pages. Do not union the stemmed map onto them.
+            return sorted(precise)
+        # Recall is a soft fill only when precision names no pages.
         hits: set[int] = set()
-        for alias in keyword_aliases(keyword):
+        for alias in aliases:
             for page in _lookup_single(rec, alias):
                 hits.add(int(page))
         return sorted(hits)
@@ -828,29 +942,21 @@ class DocumentStore:
             return doc_id
 
         with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-            pages: dict[int, str] = {}
+            pages = _page_bodies(doc)
             labels: dict[int, str] = {}
             for i in range(doc.page_count):
-                page = doc.load_page(i)
                 page_no = i + 1
-                pages[page_no] = _extract_page_text(page)
                 try:
-                    labels[page_no] = str(page.get_label() or page_no)
+                    labels[page_no] = str(doc.load_page(i).get_label() or page_no)
                 except Exception:
                     labels[page_no] = str(page_no)
 
             pages = remove_repeated_headers_footers(pages)
             pages = {n: clean_page_text(t) for n, t in pages.items()}
 
-            toc_heads = _headings_from_toc(doc, doc.page_count)
-            if _headings_usable(toc_heads, doc.page_count):
-                headings = toc_heads
-            else:
-                headings = _headings_from_fonts(doc)
-                if not headings and toc_heads:
-                    headings = _filter_headings(toc_heads, page_count=doc.page_count)
-            headings = _filter_headings(headings, page_count=doc.page_count)
+            headings, heading_source = _build_section_tree(doc, pages)
             index = build_inverted_index(pages)
+            precision_index = build_precision_index(pages)
 
             meta_title = (doc.metadata or {}).get("title") or ""
             meta = {
@@ -860,6 +966,7 @@ class DocumentStore:
                 "page_count": doc.page_count,
                 "content_sha256_16": hashlib.sha256(file_bytes).hexdigest()[:16],
                 "sha256_16": doc_id,
+                "heading_source": heading_source,
             }
             if owner_id and owner_id != "local":
                 meta["owner_id"] = owner_id
@@ -870,6 +977,7 @@ class DocumentStore:
                 labels=labels,
                 headings=headings,
                 index=index,
+                precision_index=precision_index,
             )
             self._docs[doc_id] = rec
             if source_name:
