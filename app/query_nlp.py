@@ -18,7 +18,7 @@ if _DATA_DIR not in nltk.data.path:
 
 # English stop lists include words that can change policy conditions. Keep them.
 _MEANING_WORDS = frozenset({
-    "no", "nor", "not", "n't", "before", "after", "until", "only",
+    "no", "nor", "not", "n't", "except", "before", "after", "until", "only",
     "above", "below", "under", "over", "between", "against", "without",
     "more", "less", "most", "few", "same",
 })
@@ -63,5 +63,15 @@ def query_tokens(text: str) -> list[str]:
 
 
 def content_words(text: str) -> list[str]:
-    """Keep ordered query words useful for keywords and heading matching."""
-    return [token for token in query_tokens(text) if token.lower() not in QUERY_STOPWORDS]
+    """Keep ordered query words useful for keywords and heading matching.
+
+    Digits, and the cues not/no/except, are never treated as filler.
+    """
+    kept: list[str] = []
+    for token in query_tokens(text):
+        if any(ch.isdigit() for ch in token):
+            kept.append(token)
+            continue
+        if token.lower() not in QUERY_STOPWORDS:
+            kept.append(token)
+    return kept

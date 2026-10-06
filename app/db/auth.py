@@ -6,6 +6,8 @@ import hashlib
 import hmac
 import logging
 import secrets
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -15,6 +17,10 @@ logger = logging.getLogger(__name__)
 
 _SESSION_DAYS = 14
 _PBKDF2_ITERS = 120_000
+# Avoid a remote round-trip on every /ask /ingest while testing locally.
+_TOKEN_CACHE_TTL_SEC = 300.0
+_TOKEN_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_TOKEN_CACHE_LOCK = threading.Lock()
 
 
 def _hash_password(password: str, salt: bytes | None = None) -> str:
@@ -67,11 +73,13 @@ def signup(email: str, password: str) -> dict[str, Any]:
         ).fetchone()
         token, expires = _create_session(conn, str(row["id"]))
         conn.commit()
+    user = {"id": str(row["id"]), "email": row["email"]}
+    _cache_session(token, user)
     logger.info("auth_signup email=%s", email_n)
     return {
         "token": token,
         "expires_at": expires.isoformat(),
-        "user": {"id": str(row["id"]), "email": row["email"]},
+        "user": user,
     }
 
 
@@ -88,17 +96,21 @@ def login(email: str, password: str) -> dict[str, Any]:
             raise ValueError("Invalid email or password")
         token, expires = _create_session(conn, str(row["id"]))
         conn.commit()
+    user = {"id": str(row["id"]), "email": row["email"]}
+    _cache_session(token, user)
     logger.info("auth_login email=%s", email_n)
     return {
         "token": token,
         "expires_at": expires.isoformat(),
-        "user": {"id": str(row["id"]), "email": row["email"]},
+        "user": user,
     }
 
 
 def logout(token: str) -> None:
     if not db_enabled() or not token:
         return
+    with _TOKEN_CACHE_LOCK:
+        _TOKEN_CACHE.pop(token, None)
     with connect() as conn:
         conn.execute("DELETE FROM sessions WHERE token = %s", (token,))
         conn.commit()
@@ -107,6 +119,12 @@ def logout(token: str) -> None:
 def user_from_token(token: str) -> dict[str, Any] | None:
     if not db_enabled() or not token:
         return None
+    now = time.time()
+    with _TOKEN_CACHE_LOCK:
+        hit = _TOKEN_CACHE.get(token)
+        if hit is not None and hit[0] > now:
+            return dict(hit[1])
+
     with connect() as conn:
         row = conn.execute(
             """
@@ -118,6 +136,8 @@ def user_from_token(token: str) -> dict[str, Any] | None:
             (token,),
         ).fetchone()
         if not row:
+            with _TOKEN_CACHE_LOCK:
+                _TOKEN_CACHE.pop(token, None)
             return None
         expires = row["expires_at"]
         if expires.tzinfo is None:
@@ -125,8 +145,18 @@ def user_from_token(token: str) -> dict[str, Any] | None:
         if expires < datetime.now(timezone.utc):
             conn.execute("DELETE FROM sessions WHERE token = %s", (token,))
             conn.commit()
+            with _TOKEN_CACHE_LOCK:
+                _TOKEN_CACHE.pop(token, None)
             return None
-    return {"id": str(row["id"]), "email": row["email"]}
+    user = {"id": str(row["id"]), "email": row["email"]}
+    with _TOKEN_CACHE_LOCK:
+        _TOKEN_CACHE[token] = (now + _TOKEN_CACHE_TTL_SEC, user)
+    return user
+
+
+def _cache_session(token: str, user: dict[str, Any]) -> None:
+    with _TOKEN_CACHE_LOCK:
+        _TOKEN_CACHE[token] = (time.time() + _TOKEN_CACHE_TTL_SEC, dict(user))
 
 
 def _create_session(conn: Any, user_id: str) -> tuple[str, datetime]:

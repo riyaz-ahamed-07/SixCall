@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from typing import Any
 
+from app.agent.abstain import format_abstain_text
 from app.agent.answerer import draft_answer
 from app.agent.verifier import verify_quotes
 from app.config import REQUEST_DEADLINE_SEC
 from app.deadline import DeadlineExceededError, clear_deadline, start_deadline
+from app.logging_setup import short, step
 from app.tools.get_page import get_page
 from app.tools.list_headings import list_headings
 from app.tools.wrapper import (
@@ -158,7 +161,7 @@ def select_overview_pages(
     return chosen[:_MAX_OVERVIEW_PAGES]
 
 
-_LIGHT_HEADING_CAP = 12
+_LIGHT_HEADING_CAP = 16
 
 _LIGHT_SUMMARY_SYSTEM = """Role: document analyst. You write a brief orientation summary
 from the document's table of contents / heading list only.
@@ -167,9 +170,51 @@ Rules:
 - 2–4 short sentences about what the document appears to cover.
 - Use only the supplied headings. Do not invent section content.
 - Prefer concrete topic names from the headings.
+- Prefer quote ids whose titles are at least a few words (avoid tiny titles).
 - JSON only: {"status":"ok|insufficient_information","answer":"...","quotes":[{"id":"H1"}]}
 - quotes must reference heading evidence IDs (H1, H2, …). Include 1–3 quotes.
 """
+
+
+def _heading_quote_ok(title: str) -> bool:
+    from app.agent.verifier import MIN_QUOTE_CHARS, _norm_for_match
+
+    return len(_norm_for_match(title or "")) >= MIN_QUOTE_CHARS
+
+
+def _sample_light_headings(headings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Prefer quotable titles; sample across the TOC for long documents."""
+    quotable = [
+        h
+        for h in headings
+        if _heading_quote_ok(str(h.get("title") or "").strip())
+    ]
+    pool = quotable or list(headings)
+    if len(pool) <= _LIGHT_HEADING_CAP:
+        return pool
+    n = len(pool)
+    idxs = sorted(
+        {
+            0,
+            n // 5,
+            (2 * n) // 5,
+            (3 * n) // 5,
+            (4 * n) // 5,
+            n - 1,
+            *[
+                int(round(i * (n - 1) / max(1, _LIGHT_HEADING_CAP - 1)))
+                for i in range(_LIGHT_HEADING_CAP)
+            ],
+        }
+    )
+    picked: list[dict[str, Any]] = []
+    for i in idxs:
+        if len(picked) >= _LIGHT_HEADING_CAP:
+            break
+        h = pool[i]
+        if h not in picked:
+            picked.append(h)
+    return picked[:_LIGHT_HEADING_CAP]
 
 
 def run_light_summary(doc_id: str) -> dict[str, Any]:
@@ -183,18 +228,21 @@ def run_light_summary(doc_id: str) -> dict[str, Any]:
     start_deadline(REQUEST_DEADLINE_SEC)
     session = start_question(question_id, doc_id=doc_id)
     strategy = "light_summary"
+    step("OVERVIEW", "START light", qid=question_id, doc=doc_id)
 
     def _insufficient(reason: str, *, status_reason: str | None = None) -> dict[str, Any]:
         clear_active_session()
         clear_deadline()
+        text, support = format_abstain_text(reason)
+        step("OVERVIEW", "DONE light insufficient", qid=question_id, reason=short(reason, limit=80))
         return {
-            "text": "insufficient information",
+            "text": text,
             "status": "insufficient_information",
             "pages_used": [],
             "tool_trace": [r.as_dict() for r in session.trace],
             "calls_used": session.calls_used,
             "question_id": question_id,
-            "reason": reason,
+            "reason": support,
             "status_reason": status_reason or reason,
             "intent": "overview",
             "strategy": strategy,
@@ -214,14 +262,15 @@ def run_light_summary(doc_id: str) -> dict[str, Any]:
                 status_reason="unreadable_document",
             )
 
-        real = [
+        filtered = [
             h
             for h in (headings if isinstance(headings, list) else [])
             if str(h.get("title") or "").strip() not in ("", "(document)")
             and not str(h.get("title") or "")
             .lower()
             .startswith(("fig.", "figure", "table", "eq."))
-        ][:_LIGHT_HEADING_CAP]
+        ]
+        real = _sample_light_headings(filtered)
 
         if not real:
             return _insufficient("no headings available", status_reason="no_evidence")
@@ -272,30 +321,46 @@ def run_light_summary(doc_id: str) -> dict[str, Any]:
                 continue
             title = str(h.get("title") or "").strip()
             start = int(h.get("start") or 1)
-            if title:
+            if title and _heading_quote_ok(title):
                 quotes.append({"text": title, "page": start})
             if len(quotes) >= 3:
                 break
 
         if not quotes:
-            # Fallback: first heading as the sole evidence quote.
-            h0 = real[0]
-            quotes = [
-                {
-                    "text": str(h0.get("title") or "").strip(),
-                    "page": int(h0.get("start") or 1),
-                }
-            ]
+            for h in sorted(
+                real,
+                key=lambda x: len(str(x.get("title") or "").strip()),
+                reverse=True,
+            ):
+                title = str(h.get("title") or "").strip()
+                if _heading_quote_ok(title):
+                    quotes = [
+                        {"text": title, "page": int(h.get("start") or 1)}
+                    ]
+                    break
 
-        ok, failures = verify_quotes(quotes, pages)
-        if not ok:
-            return _insufficient(
-                "quote verification failed: " + "; ".join(failures[:3]),
-                status_reason="invalid_output",
-            )
+        if quotes:
+            ok, failures = verify_quotes(quotes, pages)
+            if not ok:
+                # Drop short/bad cites; keep summary if any quote still verifies.
+                kept: list[dict[str, Any]] = []
+                for q in quotes:
+                    q_ok, _ = verify_quotes([q], pages)
+                    if q_ok:
+                        kept.append(q)
+                quotes = kept
+            if not quotes:
+                return _insufficient(
+                    "quote verification failed: " + "; ".join(failures[:3]),
+                    status_reason="invalid_output",
+                )
+        else:
+            # All headings too short to cite — still return orientation text.
+            quotes = []
 
         clear_active_session()
         clear_deadline()
+        step("OVERVIEW", "DONE light ok", qid=question_id, calls=session.calls_used)
         return {
             "text": answer,
             "status": "ok",
@@ -335,19 +400,28 @@ def run_overview(doc_id: str, question: str | None = None) -> dict[str, Any]:
     fetched: dict[int, str] = {}
     strategy = "overview"
     page_count = 1
+    step("OVERVIEW", "START", qid=question_id, doc=doc_id, q=short(question))
 
     def _insufficient(reason: str, *, status_reason: str | None = None) -> dict[str, Any]:
         fetched.clear()
         clear_active_session()
         clear_deadline()
+        text, support = format_abstain_text(reason)
+        step(
+            "OVERVIEW",
+            "DONE insufficient",
+            qid=question_id,
+            reason=short(reason, limit=120),
+            calls=session.calls_used,
+        )
         return {
-            "text": "insufficient information",
+            "text": text,
             "status": "insufficient_information",
             "pages_used": sorted(set(pages_used)),
             "tool_trace": [r.as_dict() for r in session.trace],
             "calls_used": session.calls_used,
             "question_id": question_id,
-            "reason": reason,
+            "reason": support,
             "status_reason": status_reason or reason,
             "intent": "overview",
             "strategy": strategy,
@@ -425,7 +499,8 @@ def run_overview(doc_id: str, question: str | None = None) -> dict[str, Any]:
         if not str(draft.get("answer") or "").strip():
             return _insufficient("empty answer", status_reason="invalid_output")
 
-        ok, failures = verify_quotes(draft.get("quotes") or [], fetched)
+        quotes = list(draft.get("quotes") or [])
+        ok, failures = verify_quotes(quotes, fetched)
         if not ok:
             return _insufficient(
                 "quote verification failed: " + "; ".join(failures[:3]),
@@ -435,6 +510,13 @@ def run_overview(doc_id: str, question: str | None = None) -> dict[str, Any]:
         fetched.clear()
         clear_active_session()
         clear_deadline()
+        step(
+            "OVERVIEW",
+            "DONE ok",
+            qid=question_id,
+            calls=session.calls_used,
+            pages=sorted(set(pages_used)),
+        )
         return {
             "text": draft.get("answer") or "",
             "status": "ok",
@@ -442,7 +524,7 @@ def run_overview(doc_id: str, question: str | None = None) -> dict[str, Any]:
             "tool_trace": [r.as_dict() for r in session.trace],
             "calls_used": session.calls_used,
             "question_id": question_id,
-            "quotes": draft.get("quotes") or [],
+            "quotes": quotes,
             "evidence_cleared": True,
             "intent": "overview",
             "strategy": strategy,

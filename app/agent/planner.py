@@ -51,6 +51,7 @@ def _normalize_plan(
     ]
     if not keywords:
         keywords = _heuristic_keywords(question)
+    keywords = _prepend_topic_keywords(question, keywords)
 
     heading_hints = [
         str(h).strip() for h in (data.get("heading_hints") or []) if str(h).strip()
@@ -89,6 +90,74 @@ def _heuristic_plan(question: str, headings: list[dict[str, Any]]) -> dict[str, 
     }
 
 
+def _prepend_topic_keywords(question: str, keywords: list[str]) -> list[str]:
+    """Put document-specific acronyms/topics first so search runs before broad terms."""
+    q = question or ""
+    front: list[str] = []
+    if re.search(r"\bCSV\b|comma[\s-]separated\s+values?", q, re.I):
+        front.extend(["Comma Separated Values", "CSV"])
+    if re.search(r"\bJSON\b|javascript object notation", q, re.I):
+        front.append("JSON")
+    if re.search(r"\bTSV\b|tab[\s-]separated", q, re.I):
+        front.append("Tab Separated Values")
+    if re.search(r"\bwrite (a |an )?(program|function|script)\b", q, re.I):
+        front.append("Exercise")
+    # "sample code for operators" → Operators first (not "sample code").
+    topic = _sample_code_topic(q)
+    if topic:
+        front.append(topic)
+    skip = {
+        "sample code",
+        "code sample",
+        "code snippet",
+        "example code",
+        "pseudocode",
+        "pseudo code",
+        "examples",
+        "basics",
+    }
+    # Topic terms from the question first; append Code Sample after so TOC hits lose.
+    seen: set[str] = set()
+    merged: list[str] = []
+    for k in [*front, *keywords]:
+        key = k.strip()
+        if not key:
+            continue
+        low = key.lower()
+        if low in seen or low in skip:
+            continue
+        seen.add(low)
+        merged.append(key)
+    if re.search(
+        r"\b(sample code|code sample|code snippet|example code)\b", q, re.I
+    ):
+        for extra in ("Code Sample", "Algorithm"):
+            if extra.lower() not in seen:
+                merged.append(extra)
+                seen.add(extra.lower())
+    if re.search(r"\b(pseudocode|pseudo[\s-]?code)\b", q, re.I):
+        for extra in ("Pseudocode", "Algorithm"):
+            if extra.lower() not in seen:
+                merged.append(extra)
+                seen.add(extra.lower())
+    return merged[:4]
+
+
+def _sample_code_topic(question: str) -> str | None:
+    m = re.search(
+        r"\b(?:sample code|code sample|code snippet|example code|pseudocode)"
+        r"\s+for\s+(.+?)\s*$",
+        question or "",
+        re.I,
+    )
+    if not m:
+        return None
+    topic = re.sub(r"[?.!]+$", "", m.group(1)).strip()
+    if not topic or len(topic) > 40:
+        return None
+    return topic.title() if topic.islower() else topic
+
+
 def _heuristic_keywords(question: str) -> list[str]:
     keywords: list[str] = []
     # Keep algorithm names like A* before generic tokenization strips them
@@ -109,16 +178,9 @@ def _heuristic_keywords(question: str) -> list[str]:
         if len(keywords) >= 4:
             break
 
-    # Expand common acronyms to a longer alternate for sparse indexes.
-    expanded: list[str] = []
-    for k in keywords:
-        expanded.append(k)
-        low = k.lower()
-        if low == "ai" and "Artificial Intelligence" not in expanded:
-            expanded.append("Artificial Intelligence")
-        elif low == "ml" and "machine learning" not in {x.lower() for x in expanded}:
-            expanded.append("machine learning")
-    return expanded[:4] or [question.strip()[:40]]
+    # Pins stay inside the question. Do not expand a short token into a
+    # different phrase the user did not write.
+    return keywords[:4] or [question.strip()[:40]]
 
 
 def _is_usable_keyword(keyword: str, question: str) -> bool:

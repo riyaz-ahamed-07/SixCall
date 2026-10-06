@@ -14,7 +14,7 @@ def score_pages(
     top_k: int = 3,
 ) -> list[int]:
     """
-    Tree + keyword combine (not vector search, not MCTS).
+    Tree + keyword combine. Local scoring only; no model call.
 
     Prefer pages in BOTH keyword hits and heading ranges, then rare hits, then neighbors.
     """

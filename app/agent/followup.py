@@ -4,6 +4,7 @@ import re
 import uuid
 from typing import Any
 
+from app.agent.abstain import format_abstain_text
 from app.deadline import clear_deadline, start_deadline
 from app.config import REQUEST_DEADLINE_SEC
 from app.llm.client import get_llm
@@ -179,12 +180,14 @@ def run_followup(
                 status_reason="invalid_output",
             )
         if status != "ok":
-            if not answer:
-                answer = "insufficient information"
+            detail = answer or "follow-up needs a new document lookup"
+            if "follow-up needs a new document lookup" not in detail.lower():
+                detail = f"{detail}\n\nfollow-up needs a new document lookup"
+            text, support = format_abstain_text(detail)
             return _done(
-                text=answer,
+                text=text,
                 status="insufficient_information",
-                reason="follow-up needs a new document lookup",
+                reason=support or "follow-up needs a new document lookup",
                 status_reason="no_evidence",
             )
         return _done(text=answer, status="ok")

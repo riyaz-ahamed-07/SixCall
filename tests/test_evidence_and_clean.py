@@ -30,6 +30,15 @@ def test_clean_page_text_strips_watermark_fragments():
     assert "Huntrix" in cleaned
 
 
+def test_scrubber_keeps_ate_and_lone_a_line():
+    raw = "The committee ate lunch.\nA\nPlease create a late date."
+    cleaned = clean_page_text(raw)
+    assert "ate" in cleaned
+    assert "create" in cleaned
+    assert "date" in cleaned
+    assert "\nA\n" in f"\n{cleaned}\n" or cleaned.splitlines()[1] == "A" or "A" in cleaned.splitlines()
+
+
 def test_filter_headings_drops_watermark_junk():
     from app.store.document_store import Heading, _filter_headings
 
@@ -50,6 +59,45 @@ def test_filter_headings_drops_watermark_junk():
     assert all("WATER" not in t.upper() for t in titles)
 
 
+def test_genre_spans_keep_table_rows_code_lines_and_later_pages():
+    pages = {
+        1: "\n".join(f"Sentence number {i} is filler text here." for i in range(30)),
+        2: "Item | Days | Fee\nWidget | 14 | 3\nGadget | 30 | 5",
+        3: "int refundWindow = 14;\nreturn refundWindow;",
+    }
+    spans = build_evidence_spans(pages)
+    page1 = [s for s in spans if s["page"] == 1]
+    assert 0 < len(page1) <= 8
+    table = [s for s in spans if s["page"] == 2]
+    assert table
+    assert all(s["genre"] == "table" for s in table)
+    assert any("14" in s["text"] for s in table)
+    code = [s for s in spans if s["page"] == 3]
+    assert code
+    assert all(s["genre"] == "code" for s in code)
+    assert any("refundWindow" in s["text"] for s in code)
+    assert all(s["page"] in pages for s in spans)
+
+
+def test_answer_draft_rejects_malformed_json(monkeypatch):
+    from app.agent.answerer import draft_answer
+
+    class _FakeLLM:
+        def complete_json(self, *args, **kwargs):
+            return ["not", "an", "object"]
+
+    monkeypatch.setattr("app.agent.answerer.get_llm", lambda: _FakeLLM())
+    draft = draft_answer(
+        question="What is the refund window?",
+        plan={"intent": "fact", "format_card": "", "rewritten": "", "qtype": "fact"},
+        pages={1: "The refund window is 14 days."},
+        unused_candidates=[],
+        budget_left=0,
+    )
+    assert draft["status"] == "insufficient_information"
+    assert draft.get("error") == "invalid_output"
+
+
 def test_evidence_ids_resolve_to_exact_verifiable_spans():
     pages = {
         1: (
@@ -63,3 +111,55 @@ def test_evidence_ids_resolve_to_exact_verifiable_spans():
     ok, failures = verify_quotes(quotes, pages)
     assert ok is True
     assert failures == []
+
+
+def test_extend_quotes_lengthens_short_citation():
+    from app.agent.evidence import extend_quotes
+
+    pages = {
+        1: (
+            "Numerical operators allow you to create complex expressions involving "
+            "either numerical literals and/or numerical variables. The unary negation "
+            "operator allows you to negate a numerical literal or variable."
+        )
+    }
+    short = [{"text": "Numerical operators allow you", "page": 1}]
+    extended = extend_quotes(short, pages)
+    assert len(extended[0]["text"].split()) > len(short[0]["text"].split())
+    ok, failures = verify_quotes(extended, pages)
+    assert ok is True
+    assert failures == []
+
+
+def test_evidence_keeps_code_lines_intact():
+    pages = {
+        1: (
+            "Write a CSV to JSON converter.\n"
+            "  FILE *in = fopen(\"data.csv\", \"r\");\n"
+            "  while (fgets(buf, sizeof(buf), in)) {\n"
+            "    printf(\"%s\\n\", buf);\n"
+            "  }\n"
+            "Then close the file."
+        )
+    }
+    spans = build_evidence_spans(pages)
+    texts = [s["text"] for s in spans]
+    assert any("fopen" in t for t in texts)
+    assert any("fgets" in t for t in texts)
+    code_quote = next(t for t in texts if "fopen" in t)
+    ok, failures = verify_quotes([{"text": code_quote, "page": 1}], pages)
+    assert ok is True
+    assert failures == []
+
+
+def test_repair_quotes_rejects_paraphrase_instead_of_substituting_code():
+    from app.agent.evidence import repair_quotes
+
+    pages = {
+        1: 'int main(void) {\n  FILE *fp = fopen("a.csv", "r");\n  return 0;\n}\n'
+    }
+    repaired = repair_quotes(
+        [{"text": "open a.csv with fopen", "page": 1}],
+        pages,
+    )
+    assert repaired == []

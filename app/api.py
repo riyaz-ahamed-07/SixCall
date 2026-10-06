@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import os
+import time
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -11,8 +14,11 @@ from app.agent.followup import (
 )
 from app.agent.loop import run_agent
 from app.agent.overview import is_overview_question, run_light_summary, run_overview
+from app.logging_setup import short, step
 from app.store.document_store import get_store
 from app.tools.wrapper import get_trace as _get_trace
+
+logger = logging.getLogger(__name__)
 
 
 class Answer(BaseModel):
@@ -27,6 +33,7 @@ class Answer(BaseModel):
     quotes: list[dict[str, Any]] = Field(default_factory=list)
     intent: str | None = None
     strategy: str | None = None
+    timing: dict[str, Any] | None = None
 
 
 def ingest_pdf(path: str, *, owner_id: str | None = None, source_name: str | None = None) -> str:
@@ -47,6 +54,7 @@ def _to_answer(result: dict[str, Any]) -> Answer:
         quotes=list(result.get("quotes") or []),
         intent=result.get("intent"),
         strategy=result.get("strategy"),
+        timing=result.get("timing"),
     )
 
 
@@ -73,6 +81,11 @@ def _persist_answer(
         logging.getLogger(__name__).warning("answer_db_persist_failed qid=%s error=%s", answer.question_id, type(exc).__name__)
 
 
+def _followups_enabled() -> bool:
+    """Chat-memory answers stay off unless SIXCALL_FOLLOWUPS=1."""
+    return os.getenv("SIXCALL_FOLLOWUPS", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def ask(
     doc_id: str,
     question: str,
@@ -82,22 +95,57 @@ def ask(
 ) -> Answer:
     """
     Route:
-      follow-up (with history) → no document tools
-      overview phrasing → overview path
-      else → budgeted tree+keyword agent
+      SIXCALL_FOLLOWUPS=1 and a pure clarification → prior quotes, else tools
+      overview phrasing → heading sample via get_page
+      else → budgeted structure-first agent
+
+    A live ask that still has zero tool calls is sent through the agent.
+    Follow-ups that need evidence cannot answer from memory alone.
     """
     hist = list(history or [])
-    if is_followup_question(question, hist) and not prior_answer_was_insufficient(hist):
+    t0 = time.perf_counter()
+    route = "agent"
+    if (
+        _followups_enabled()
+        and is_followup_question(question, hist)
+        and not prior_answer_was_insufficient(hist)
+    ):
+        route = "followup"
+        step("ASK", "route=followup", doc=doc_id, q=short(question))
         result = run_followup(doc_id, question, hist)
-        # If memory alone can't answer, reopen the document with tools.
-        if result.get("status") != "ok":
+        if result.get("status") != "ok" or int(result.get("calls_used") or 0) <= 0:
+            route = "agent(after_followup)"
+            step("ASK", "followup empty → agent", doc=doc_id)
             result = run_agent(doc_id, question)
     elif is_overview_question(question):
+        route = "overview"
+        step("ASK", "route=overview", doc=doc_id, q=short(question))
         result = run_overview(doc_id, question)
     else:
+        step("ASK", "route=agent", doc=doc_id, q=short(question))
+        result = run_agent(doc_id, question)
+    if int(result.get("calls_used") or 0) <= 0 and (question or "").strip():
+        route = "agent(zero_calls_retry)"
+        step("ASK", "zero calls → agent retry", doc=doc_id)
         result = run_agent(doc_id, question)
     answer = _to_answer(result)
+    step(
+        "ASK",
+        "persist answer …",
+        qid=answer.question_id,
+        status=answer.status,
+        route=route,
+    )
     _persist_answer(doc_id, question, answer, owner_id=owner_id)
+    step(
+        "ASK",
+        "complete",
+        qid=answer.question_id,
+        status=answer.status,
+        route=route,
+        calls=answer.calls_used,
+        elapsed_ms=(time.perf_counter() - t0) * 1000,
+    )
     return answer
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.config import DOC_STORE_DIR, MAX_TOOL_CALLS
+from app.logging_setup import short
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ class ToolCallRecord:
     timestamp: float
     call_index: int
     error: str | None = None
+    elapsed_ms: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -43,6 +45,7 @@ class ToolCallRecord:
             "timestamp": self.timestamp,
             "call_index": self.call_index,
             "error": self.error,
+            "elapsed_ms": round(float(self.elapsed_ms or 0.0), 3),
         }
 
 
@@ -88,24 +91,49 @@ class ToolSession:
             )
 
         self.calls_used = next_index
+        arg_preview = _args_preview(tool_name, kwargs)
+        logger.info(
+            "tool #%d/%d -> %s %s  qid=%s",
+            next_index,
+            self.max_calls,
+            tool_name,
+            arg_preview,
+            self.question_id,
+        )
+        started = time.perf_counter()
         try:
             result = fn(**kwargs)
         except Exception as exc:
+            elapsed_ms = (time.perf_counter() - started) * 1000
             error = f"{type(exc).__name__}: {exc}"
             record = ToolCallRecord(
                 question_id=self.question_id,
                 tool=tool_name,
                 args=kwargs,
-                result_summary=f"ERROR: {error}",
+                result_summary=f"ERROR: {error} budget_left={self.budget_left} elapsed_ms={elapsed_ms:.2f}",
                 timestamp=time.time(),
                 call_index=next_index,
                 error=error,
+                elapsed_ms=elapsed_ms,
             )
             self.trace.append(record)
             _persist_record_safe(record)
+            logger.info(
+                "tool #%d/%d FAIL %s -> %s  %.0fms  qid=%s",
+                next_index,
+                self.max_calls,
+                tool_name,
+                type(exc).__name__,
+                elapsed_ms,
+                self.question_id,
+            )
             raise
 
-        summary = _summarize(tool_name, result)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        summary = (
+            f"{_summarize(tool_name, result)} "
+            f"budget_left={self.budget_left} elapsed_ms={elapsed_ms:.2f}"
+        )
         record = ToolCallRecord(
             question_id=self.question_id,
             tool=tool_name,
@@ -114,6 +142,16 @@ class ToolSession:
             timestamp=time.time(),
             call_index=next_index,
             error=None,
+            elapsed_ms=elapsed_ms,
+        )
+        logger.info(
+            "tool #%d/%d OK  %s -> %s  %.0fms  qid=%s",
+            next_index,
+            self.max_calls,
+            tool_name,
+            short(_summarize(tool_name, result), limit=100),
+            elapsed_ms,
+            self.question_id,
         )
         self.trace.append(record)
         _persist_record_safe(record)
@@ -252,3 +290,16 @@ def _summarize(tool_name: str, result: Any) -> str:
         items = list(result or [])
         return f"count={len(items)}"
     return repr(result)[:200]
+
+
+def _args_preview(tool_name: str, kwargs: dict[str, Any]) -> str:
+    if tool_name == "get_page":
+        return f"page={kwargs.get('page_number') or kwargs.get('page')}"
+    if tool_name == "search_keyword":
+        kw = kwargs.get("keyword")
+        return f"keyword={short(kw if not isinstance(kw, list) else kw, limit=60)}"
+    if tool_name in ("list_headings", "list_documents"):
+        return f"doc={short(kwargs.get('doc_id'), limit=16)}"
+    skip = {"doc_id"}
+    parts = [f"{k}={short(v, limit=40)}" for k, v in kwargs.items() if k not in skip]
+    return " ".join(parts[:4]) or "-"

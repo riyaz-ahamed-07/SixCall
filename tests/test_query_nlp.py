@@ -7,10 +7,10 @@ from app.textutil import tokenize
 
 def test_nltk_stopwords_remove_filler_but_keep_policy_conditions():
     words = {w.lower() for w in content_words(
-        "Please tell us whether we ourselves are not eligible before or after 14 days."
+        "Please tell us whether we ourselves are not eligible except no items before or after 14 days."
     )}
     assert not words & {"please", "tell", "we", "ourselves", "are", "or"}
-    assert {"not", "before", "after", "14", "eligible"} <= words
+    assert {"not", "no", "except", "before", "after", "14", "eligible"} <= words
     assert "ourselves" in QUERY_STOPWORDS
     assert "ourselves" not in content_words("We ourselves. They apply.")
 

@@ -14,14 +14,12 @@ import StreamingText, {
   type StreamingToken,
 } from "@/components/agent/StreamingText";
 import ThinkingState from "@/components/agent/ThinkingState";
-import ToolChips from "@/components/agent/ToolChips";
 import UploadProgress from "@/components/agent/UploadProgress";
 import {
   askQuestion,
   deleteDocument,
   ingestPdf,
   listDocuments,
-  overviewDocument,
   type AskAnswer,
   type ChatTurn,
   type DocSummary,
@@ -30,9 +28,9 @@ import { useAuth } from "@/lib/auth";
 import { formatDocName } from "@/lib/docs";
 
 const SUGGESTIONS = [
-  "What is this document about?",
   "Summarize the introduction",
   "Define the main concept on page 1",
+  "What are the main sections?",
 ];
 
 const CHATS_KEY = "sixcall.chats.v2";
@@ -52,9 +50,9 @@ function tokensFromText(text: string): StreamingToken[] {
 
 function sourcesFromAnswer(answer: AskAnswer): StreamingSource[] {
   return (answer.quotes ?? []).map((quote, index) => ({
-    name: `Quote ${index + 1}`,
-    domain: quote.page != null ? `page ${quote.page}` : "quote",
-    excerpt: quote.text ?? undefined,
+    name: `Ref ${index + 1}`,
+    domain: quote.page != null ? `p.${quote.page}` : "source",
+    excerpt: (quote.text ?? "").trim() || undefined,
   }));
 }
 
@@ -335,14 +333,9 @@ export default function AgentShell({ userEmail }: { userEmail?: string }) {
     setUploading(true);
     try {
       const result = await ingestPdf(file);
-      let catalog: DocSummary[] = [];
-      try {
-        catalog = await listDocuments();
-      } catch {
-        catalog = [];
-      }
-      const fromApi = catalog.find((d) => d.doc_id === result.doc_id);
-      const doc: DocSummary = fromApi ?? {
+      // Attach to this chat only — fresh turns; other chats keep their own history.
+      // Reused store docs share doc_id but never share chat turns.
+      const doc: DocSummary = {
         doc_id: result.doc_id,
         title: result.filename,
         source_name: result.filename,
@@ -361,7 +354,7 @@ export default function AgentShell({ userEmail }: { userEmail?: string }) {
                 title,
                 docId: result.doc_id,
                 doc,
-                turns: [], // this chat only — fresh thread for the new PDF
+                turns: [],
               }
             : c,
         );
@@ -370,60 +363,8 @@ export default function AgentShell({ userEmail }: { userEmail?: string }) {
       });
       setActiveChatId(chatId);
       setStatus(`Ready · ${result.filename}`);
-      setUploading(false);
-      setUploadName(null);
-
-      // Light TOC orientation (1 tool: list_headings) — show as first assistant turn.
-      const requestId = ++askRequestId.current;
-      setAsking(true);
-      setStatus("Orienting from headings…");
-      try {
-        const answer = await overviewDocument(result.doc_id, undefined, {
-          light: true,
-        });
-        if (
-          requestId !== askRequestId.current ||
-          askScope.current?.chatId !== chatId ||
-          askScope.current?.docId !== result.doc_id
-        ) {
-          return;
-        }
-        setChats((prev) => {
-          const next = prev.map((c) => {
-            if (c.id !== chatId) return c;
-            return {
-              ...c,
-              turns: [
-                {
-                  id: nextTurnId("u"),
-                  role: "user" as const,
-                  text: "What is this document about?",
-                },
-                {
-                  id: answer.question_id || nextTurnId("a"),
-                  role: "assistant" as const,
-                  text: answer.text,
-                  answer,
-                },
-              ],
-            };
-          });
-          saveChats(next, chatId);
-          return next;
-        });
-        setStatus(`Ready · ${result.filename}`);
-      } catch (err) {
-        if (requestId === askRequestId.current) {
-          setError(
-            err instanceof Error ? err.message : "Could not summarize document",
-          );
-          setStatus(`Ready · ${result.filename}`);
-        }
-      } finally {
-        if (requestId === askRequestId.current) {
-          setAsking(false);
-        }
-      }
+      // Refresh catalog in background (duplicate uploads already have the doc).
+      void listDocuments().catch(() => undefined);
       return;
     } catch (err) {
       setError(err instanceof Error ? err.message : "Upload failed");
@@ -705,7 +646,15 @@ export default function AgentShell({ userEmail }: { userEmail?: string }) {
 
               const answer = turn.answer;
               const ok = answer?.status === "ok";
-              const followup = answer?.strategy === "followup";
+              const reason = (answer?.reason || "").trim();
+              const body = (turn.text || "").trim();
+              const reasonAlreadyInBody =
+                !!reason &&
+                body.toLowerCase().includes(reason.toLowerCase().slice(0, 40));
+              const displayText =
+                !ok && reason && !reasonAlreadyInBody
+                  ? `${body}\n\n${reason}`
+                  : body;
               return (
                 <div
                   key={`${turn.id}-${turnIndex}`}
@@ -715,16 +664,9 @@ export default function AgentShell({ userEmail }: { userEmail?: string }) {
                   <ThinkingState
                     rows={thinkingRows(answer)}
                     active="Working"
-                    done={
-                      followup
-                        ? "Follow-up · 0 tool calls"
-                        : `Used ${answer?.calls_used ?? 0}/6 calls`
-                    }
+                    done={`Used ${answer?.calls_used ?? 0}/6 calls`}
                     working={false}
                   />
-                  {answer?.tool_trace?.length ? (
-                    <ToolChips steps={answer.tool_trace} />
-                  ) : null}
                   <div className="answer-panel rounded-[16px] px-4 py-3.5">
                     <div className="mb-2.5 flex flex-wrap items-center gap-2">
                       <span
@@ -734,7 +676,7 @@ export default function AgentShell({ userEmail }: { userEmail?: string }) {
                             : "bg-orange/15 text-orange"
                         }`}
                       >
-                        {ok ? (followup ? "Follow-up" : "Verified") : "Abstain"}
+                        {ok ? "Verified" : "Insufficient"}
                       </span>
                       {answer?.strategy ? (
                         <span className="font-mono text-[11px] text-ink-3">
@@ -748,32 +690,10 @@ export default function AgentShell({ userEmail }: { userEmail?: string }) {
                       ) : null}
                     </div>
                     <StreamingText
-                      content={tokensFromText(turn.text)}
+                      content={tokensFromText(displayText)}
                       sources={answer ? sourcesFromAnswer(answer) : []}
-                      followUps={
-                        ok
-                          ? [
-                              "Explain that more simply",
-                              "Which page states that?",
-                            ]
-                          : [
-                              "Try a more specific keyword",
-                              "Ask about another section",
-                            ]
-                      }
-                      labels={{
-                        sources: `${answer?.quotes?.length ?? 0} quotes`,
-                        followUps: "Continue",
-                      }}
                       instant
-                      followUpsDisabled={asking}
-                      onFollowUp={(text) => void handleAsk(text)}
                     />
-                    {!ok && answer?.reason ? (
-                      <p className="mt-3 border-t border-line pt-2.5 text-[12px] leading-relaxed text-orange">
-                        {answer.reason}
-                      </p>
-                    ) : null}
                   </div>
                 </div>
               );
