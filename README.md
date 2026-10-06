@@ -2,7 +2,7 @@
 
 Hackathon build: a **budgeted PDF Q&A agent** with a FastAPI backend and a Next.js demo UI.
 
-Upload a PDF, ask questions from the Python API, CLI, or browser. Answers are constrained by **4 document tools** and a hard **6 tool-call budget**. The agent may **abstain** when quotes cannot be verified.
+Upload a PDF, ask questions from the Python API, CLI, or browser. Answers are constrained by **four document tools** and a hard **6 tool-call budget**. The agent **abstains** when quotes cannot be verified against fetched pages.
 
 ---
 
@@ -25,185 +25,122 @@ Upload a PDF, ask questions from the Python API, CLI, or browser. Answers are co
 
 ## System overview
 
-End-to-end path from browser → API → agent → tools → store → LLM → verified answer.
-
 ```mermaid
 flowchart LR
   subgraph Client["Web client"]
-    UI["Next.js 16 + React 19<br/>AgentShell"]
+    UI["Next.js + React<br/>AgentShell"]
   end
 
   subgraph API["Backend API"]
     FA["FastAPI + Uvicorn"]
-    AUTH["Bearer auth"]
-    AGENT["Agent loop"]
-    TOOLS["4 tools + budget wrapper"]
-    STORE["DocumentStore"]
-    LLM["LiteLLM client"]
+    AUTH["Bearer auth<br/>token cache"]
+    AGENT["Structure-first loop"]
+    TOOLS["Tools + budget ≤6"]
+    STORE["DocumentStore<br/>memory + disk"]
+    LLM["LiteLLM"]
   end
 
   subgraph Data["Persistence"]
-    DISK["Local .data/ cache"]
-    PG["Supabase Postgres"]
+    DISK[".data/docs local cache"]
+    PG["Supabase Postgres<br/>background sync"]
   end
 
-  subgraph Models["LLM providers"]
-    GROQ["Groq"]
-    GEM["Gemini"]
-  end
-
-  UI -->|HTTP /ingest /ask /documents| FA
+  UI -->|/ingest /ask /documents| FA
   FA --> AUTH --> AGENT
   AGENT --> TOOLS --> STORE
   AGENT --> LLM
-  STORE --> DISK
-  STORE --> PG
-  LLM --> GROQ
-  LLM --> GEM
+  STORE -->|serve chat| DISK
+  STORE -.->|async write| PG
 ```
+
+**Design rules**
+
+- Chat reads **local memory / disk** after ingest — never waits on Supabase for page text.
+- Postgres sync is **background only**; it does not replace the local catalog used for asks.
+- Same owner + PDF bytes → same `doc_id` (idempotent; re-upload is a cache hit).
 
 ---
 
 ## Technology stack
 
-| Area            | Technology                                       | Role in SixCall                          |
-| --------------- | ------------------------------------------------ | ---------------------------------------- |
-| **Web UI**      | Next.js 16, React 19, TypeScript, Tailwind CSS 4 | Chat shell, auth pages, upload / ask UX  |
-| **API**         | FastAPI, Uvicorn, python-multipart               | REST: ingest, ask, documents, auth       |
-| **Validation**  | Pydantic v2                                      | Request/response models                  |
-| **Config**      | python-dotenv                                    | `.env` + optional private keys file      |
-| **PDF parse**   | pymupdf4llm + PyMuPDF                            | Markdown page text; TOC/font headings; OCR fallback |
-| **Search**      | Precision phrases + stemmed recall, inside `search_keyword` | Page numbers only                 |
-| **NLP helpers** | NLTK (bundled `app/nltk_data`)                   | Planner tokenization / stopwords         |
-| **Quote check** | Exact span after Unicode/whitespace norm         | Verifier rejects paraphrased quotes      |
-| **LLM gateway** | LiteLLM                                          | Groq / Gemini with primary + fallback    |
-| **Database**    | Supabase Postgres via `psycopg`                  | Docs, users, sessions, Q&A, traces       |
-| **Local cache** | `.data/docs`, `.data/traces`                     | Fast local store; dual-write when DB set |
-| **Tests**       | pytest                                           | Budget, verifier, store isolation, NLP   |
+| Area | Technology | Role |
+| ---- | ---------- | ---- |
+| **Web UI** | Next.js, React, TypeScript, Tailwind | Chat shell, upload, inline cite hover |
+| **API** | FastAPI, Uvicorn, python-multipart | `/ingest`, `/ask`, `/documents`, auth |
+| **PDF text** | **PyMuPDF** (default) | Fast page extract for large textbooks |
+| **PDF markdown** | pymupdf4llm (opt-in) | `SIXCALL_MARKDOWN_EXTRACT=1` for tables |
+| **Outline** | PyMuPDF TOC → fonts → lexical | Section tree at ingest |
+| **Search** | Precision index + stemmed recall | Inside one `search_keyword` call |
+| **Quote check** | Exact / fragment / RapidFuzz ≥90 | Digits + negations must match |
+| **LLM** | LiteLLM → Groq / Gemini | TOC pick (optional) + answer |
+| **DB** | Supabase Postgres (`psycopg`) | Users, sessions, async doc sync |
+| **Local cache** | `.data/docs`, `.data/traces` | Source of truth for serving |
 
-**Explicitly not used:** agent frameworks (LangChain, LangGraph, LlamaIndex) and external outline APIs. Page selection is the section tree plus the four tools.
-
-```mermaid
-mindmap
-  root((SixCall))
-    Frontend
-      Next.js 16
-      React 19
-      TypeScript
-      Tailwind CSS 4
-    Backend
-      FastAPI
-      Uvicorn
-      Pydantic
-      python-dotenv
-    Document layer
-      PyMuPDF
-      Snowball stemmer
-      NLTK
-      Inverted index
-    Intelligence
-      LiteLLM
-      Groq
-      Gemini
-      Quote verifier
-    Data
-      Supabase Postgres
-      psycopg
-      Local .data cache
-```
+**Not used:** LangChain, LangGraph, LlamaIndex, vector RAG. Navigation is section tree + keyword pins + budgeted page reads.
 
 ---
 
 ## Layered architecture
 
-Two layers, enforced in code. The agent package imports **only the four tool functions** (+ wrapper helpers). It must **not** import `app.store` (see `tests/test_no_store_leak.py`).
+The agent imports **only tool functions** (+ wrapper). It must not import `app.store` (`tests/test_no_store_leak.py`).
 
-| Layer                                       | Owns                                                    | Sees                                             |
-| ------------------------------------------- | ------------------------------------------------------- | ------------------------------------------------ |
-| **Tool / store** (`app/store`, `app/tools`) | Parsed pages, headings, keyword index                   | Full document data                               |
-| **Agent** (`app/agent`)                     | Planner → search → score → `get_page` → answer → verify | Only tool return values for the current question |
+| Layer | Owns | Sees |
+| ----- | ---- | ---- |
+| **Store / tools** | Pages, headings, dual indexes | Full document |
+| **Agent** | Pins → section match → rank → answer → verify | Tool returns for this question only |
 
-```mermaid
-flowchart TB
-  subgraph AgentLayer["Agent layer — app/agent"]
-    PLAN["planner.py<br/>LLM plan + keywords"]
-    LOOP["loop.py<br/>orchestrator"]
-    SCORE["scorer.py<br/>classic IDF + headings"]
-    ANS["answerer.py<br/>LLM answer + evidence IDs"]
-    VER["verifier.py<br/>exact quote spans"]
-    FU["followup.py<br/>history reuse"]
-  end
+### The four tools
 
-  subgraph ToolLayer["Tool layer — app/tools"]
-    W["wrapper.py<br/>budget ≤ 6 · audit log"]
-    T1["list_documents"]
-    T2["list_headings"]
-    T3["search_keyword"]
-    T4["get_page"]
-  end
+| Tool | Returns | Used in `/ask`? |
+| ---- | ------- | --------------- |
+| `list_documents()` | Titles + metadata | **No** — HTTP catalog / discovery only |
+| `list_headings(doc_id)` | Outline ranges | **Yes** (usually first call) |
+| `search_keyword(doc_id, keyword\|pins)` | Ranked page numbers | **Yes** (one multi-pin call) |
+| `get_page(doc_id, page)` | One page’s cleaned text | **Yes** (budgeted reads) |
 
-  subgraph StoreLayer["Store — app/store"]
-    DS["DocumentStore<br/>pages · headings · index"]
-  end
-
-  LOOP --> PLAN
-  LOOP --> SCORE
-  LOOP --> ANS --> VER
-  LOOP --> FU
-  LOOP --> W
-  W --> T1 & T2 & T3 & T4
-  T1 & T2 & T3 & T4 --> DS
-
-  AgentLayer -.->|forbidden import| StoreLayer
-```
-
-### The only 4 tools
-
-1. `list_documents()` — titles + metadata
-2. `list_headings(doc_id)` — TOC / headings
-3. `get_page(doc_id, page_number)` — text of **exactly one** page
-4. `search_keyword(doc_id, keyword)` — **page numbers only**
-
-`app/tools/wrapper.py` logs every call and **refuses a 7th** tool call for that `question_id`, forcing decline / insufficient information.
-
-### What is unique here
-
-The ceiling is a **budget ledger** (six calls, logged, seventh refused). Navigation is a **section tree** from `list_headings`, **question-only pins** (a search term must appear in the question), a **supersede lock** that keeps the latest keyword hit page, and **fail-closed evidence ids** checked without another model call. `search_keyword` still returns page numbers only.
+`wrapper.py` logs every call and **refuses a 7th** for that `question_id`.
 
 ---
 
 ## Agent loop
 
-Happy path: **no planner model call**. One answer call after the tools. A weak outline may spend one TOC pick, and only to choose existing heading titles plus terms already in the question. A failed draft may spend one held `get_page` and one more answer. New questions do not answer with zero tools (`SIXCALL_FOLLOWUPS` defaults off).
+Structure-first happy path (**no planner LLM** when heading titles already overlap the question):
+
+```text
+list_headings → question-only pins → search_keyword(pins)
+  → choose_pages (section + co-occurrence) → get_page ×N → one answer → verify
+```
 
 ```mermaid
 sequenceDiagram
-  participant U as User / CLI
-  participant A as Agent loop
-  participant T as Tools (≤6)
-  participant Ans as Answer LLM
-  participant V as Span verifier
+  participant U as User
+  participant A as loop.py
+  participant T as Tools ≤6
+  participant L as Answer LLM
+  participant V as Verifier
 
   U->>A: ask(doc_id, question)
   A->>T: list_headings
-  Note over A: pins copied from the question<br/>heading-title overlap
-  A->>T: search_keyword (precision, else recall)
-  T-->>A: page numbers
-  A->>T: get_page (selected pages within budget)
-  T-->>A: page text
-  Note over A: spans built here, with stable ids
-  A->>Ans: one answer, cite span ids
-  A->>V: id exists, numbers and negations agree
-  alt verified
-    A-->>U: status=ok
-  else no evidence
+  Note over A: extract pins from question only
+  A->>T: search_keyword(pins)
+  opt weak outline + keyword hits
+    A->>L: TOC pick (existing titles only)
+  end
+  A->>T: get_page × ≤3–4
+  A->>L: answer citing evidence ids
+  A->>V: fail-closed quote check
+  alt ok
+    A-->>U: verified answer + quotes
+  else
     A-->>U: insufficient information
   end
 ```
 
-**Budget:** `1×list_headings + ≤2×search_keyword + ≤3–4×get_page ≤ 6`.
+**Typical budget:** `1×list_headings + 1×search_keyword + ≤4×get_page ≤ 6`.
 
-Page text is **untrusted data**. Injection-like lines are flagged; the answer follows the user question.
+Pins are substrings of the question (atoms before phrases). Ranking prefers pages where several pins co-occur, especially inside matched heading ranges. Contradiction-sensitive questions lock the latest keyword hit page.
+
+Follow-ups that skip tools stay **off** (`SIXCALL_FOLLOWUPS=0`).
 
 ---
 
@@ -211,21 +148,26 @@ Page text is **untrusted data**. Injection-like lines are flagged; the answer fo
 
 ```mermaid
 flowchart LR
-  PDF["PDF upload"] --> TMP["Temp file"]
-  TMP --> PYM["pymupdf4llm page text<br/>PyMuPDF TOC + OCR fallback"]
-  PYM --> CLEAN["clean_page_text<br/>TOC strip · dehyphen"]
-  CLEAN --> HEAD["Section tree<br/>TOC, fonts, lexical"]
-  CLEAN --> IDX["Dual lexical index<br/>precision then recall"]
-  HEAD --> REC["DocRecord"]
-  IDX --> REC
-  REC --> DISK[".data/docs/*.json"]
-  REC --> PG["Postgres documents"]
-  REC --> ID["doc_id = sha256[:16]<br/>(owner-scoped when auth)"]
+  PDF["POST /ingest PDF"] --> ID["doc_id = sha256(owner:bytes)[:16]"]
+  ID -->|cache hit| MEM["Return existing DocRecord"]
+  ID -->|miss| OPEN["PyMuPDF open"]
+  OPEN --> TXT["Page text<br/>PyMuPDF default<br/>pymupdf4llm if env=1"]
+  TXT --> CLEAN["Headers/footers · cleaners"]
+  CLEAN --> HEAD["Section tree<br/>TOC / font / lexical"]
+  CLEAN --> IDX["Precision + recall indexes"]
+  HEAD --> LOCAL["Memory + .data/docs/*.json"]
+  IDX --> LOCAL
+  LOCAL --> READY["HTTP 200 · chat ready"]
+  LOCAL -.->|background thread| PG["Supabase save_document"]
 ```
 
-- Display name = **uploaded filename** (not temp path stem).
-- Same bytes (+ owner) → same `doc_id` (idempotent ingest).
-- OCR path triggers on near-empty / high-garbage pages when available.
+| Setting | Default | Effect |
+| ------- | ------- | ------ |
+| `SIXCALL_MARKDOWN_EXTRACT` | `0` | Fast plain text; set `1` for markdown tables |
+| `SIXCALL_OCR` | `0` | OCR only when explicitly enabled |
+| `SIXCALL_USE_DB` | `auto` | Postgres when `DATABASE_URL` is set |
+
+After local persist, the doc is **ready for chat immediately**. DB hydrate on startup is also background and **never overwrites** an existing local catalog.
 
 ---
 
@@ -233,127 +175,95 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-  Q["question_id session"] --> W["Budget wrapper<br/>MAX_TOOL_CALLS = 6"]
-  W -->|call 1–6| STORE["DocumentStore"]
-  W -->|call 7+| BLOCK["BudgetExceededError<br/>→ abstain"]
-  W --> TRACE["Tool trace JSON<br/>.data/traces + Postgres"]
+  Q["start_question session"] --> W["Budget wrapper · max 6"]
+  W -->|1–6| STORE["DocumentStore memory"]
+  W -->|7+| BLOCK["BudgetExceededError"]
+  W --> TRACE[".data/traces + batched DB"]
 ```
 
-| Tool             | Returns                 | Burns budget                  |
-| ---------------- | ----------------------- | ----------------------------- |
-| `list_documents` | Doc metadata list       | Yes                           |
-| `list_headings`  | Heading tree / ranges   | Yes                           |
-| `search_keyword` | `list[int]` page hits   | Yes (aliases inside one call) |
-| `get_page`       | One page’s cleaned text | Yes                           |
+Page bodies never leave the store except through `get_page`. Search returns integers only.
 
 ---
 
 ## Web UI
 
-```mermaid
-flowchart TB
-  subgraph Pages["Next.js App Router"]
-    LAND["/ landing"]
-    LOGIN["/login · /signup"]
-    APP["/app AgentShell"]
-    DOCS["/docs"]
-  end
-
-  subgraph Shell["AgentShell"]
-    SIDE["SidebarNav<br/>docs · upload · new chat"]
-    CHAT["Turns · ThinkingState · ToolChips"]
-    PROMPT["PromptBar"]
-    UP["UploadProgress"]
-  end
-
-  APP --> SIDE & CHAT & PROMPT & UP
-  CHAT -->|Bearer token| API["FastAPI :8000"]
-  UP -->|POST /ingest| API
-  PROMPT -->|POST /ask| API
-```
-
-Run separately from the API (UI talks to `http://127.0.0.1:8000` directly so long `/ask` requests are not killed by a Next rewrite proxy).
+- Per-chat PDF binding (turns are chat-local; store docs can be shared by `doc_id`).
+- **Used x/6 calls** collapsed by default.
+- Quotes as **numbered cite chips**; hover shows excerpt + page (not a dumped quote list).
+- No Continue / follow-up chip path.
+- UI calls the API via `NEXT_PUBLIC_API_BASE` (e.g. `http://127.0.0.1:8002`) so long `/ingest` and `/ask` are not killed by a Next rewrite proxy.
 
 ---
 
 ## Auth & database
 
-```mermaid
-flowchart LR
-  UI["Browser"] -->|email/password| AUTH["/auth/signup · /auth/login"]
-  AUTH --> USERS["Postgres users"]
-  AUTH -->|JWT / session token| UI
-  UI -->|Authorization: Bearer| API["Protected routes"]
-  API --> OWN["Owner-scoped docs & questions"]
-  OWN --> PG["Supabase Postgres"]
-  OWN --> LOCAL[".data dual-write cache"]
-```
-
-- Set `DATABASE_URL` (Session pooler, `sslmode=require`, percent-encode passwords).
-- Apply schema **explicitly**: `python -m app.cli migrate` (API startup does **not** migrate).
-- Prefer **dev** branch for writes — never auto-migrate production/`main`.
-- `DELETE /documents` clears only the signed-in user’s files when auth is on.
+- Email/password sessions in Postgres when `DATABASE_URL` is set.
+- Bearer tokens are **cached ~5 minutes** in process to avoid a remote round-trip on every ask/upload.
+- Document **serving** stays local even after background sync completes.
+- `DELETE /documents/{id}` is owner-scoped.
+- Migrate explicitly: `python -m app.cli migrate` (API startup does not migrate).
 
 ---
 
 ## LLM routing
 
-```mermaid
-flowchart LR
-  REQ["complete_json / complete"] --> PRIM{"LLM_PRIMARY"}
-  PRIM -->|groq| G1["Groq main / fast"]
-  PRIM -->|gemini| M1["Gemini main / light"]
-  G1 -->|fallback| M1
-  M1 -->|fallback| G1
-  G1 & M1 --> OUT["JSON plan or answer"]
-```
-
-- Planner uses the **light** model path; answer uses the **main** path.
-- Attempt timeouts and a request deadline (`REQUEST_DEADLINE_SEC`) bound long asks.
-- Total provider failure → `insufficient_information`.
+- Optional **TOC pick** (light model) only when section overlap is weak but keywords already hit pages.
+- **Answer** uses the main model path; verify is local (no repair LLM by default).
+- `LLM_PRIMARY=groq|gemini` with cross-fallback when configured.
+- Bound by `REQUEST_DEADLINE_SEC` / attempt timeouts.
 
 ---
 
 ## Setup
 
 ```bash
-cd C:\Users\thahs\Projects\SixCall
+cd SixCall
 python -m venv .venv
+# Windows
 .\.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Keys: copy `.env.example` → `.env`, or keep using your private file  
-`C:\Users\thahs\Documents\RAP_LLM_KEYS.env` (auto-loaded when present).
+Copy `.env.example` → `.env`. **Never commit API keys.**
 
-**Never commit API keys.**
-
-### Web UI + API
+### API + UI
 
 ```bash
-# terminal 1 — API (prefer no --reload during demos; reload can kill in-flight /ask)
+# terminal 1 — API
 .\.venv\Scripts\activate
-uvicorn app.server:app --port 8000
+uvicorn app.server:app --host 127.0.0.1 --port 8002
 
-# terminal 2 — UI
+# terminal 2 — UI (set NEXT_PUBLIC_API_BASE to match)
 cd web
 npm install
 npm run dev
 ```
 
-Open http://localhost:3000 — sign up / log in when `DATABASE_URL` is set, upload a PDF, ask questions.
+Open http://localhost:3000 → sign in (if DB configured) → upload PDF → ask.
 
-### Database
+### Fast vs rich extract
 
 ```bash
-python -m app.cli migrate
+# Default — snappy uploads (recommended while iterating)
+SIXCALL_MARKDOWN_EXTRACT=0
+
+# Judging / table-heavy quality pass (~2–3 min on a 600-page PDF)
+SIXCALL_MARKDOWN_EXTRACT=1
 ```
+
+### Local-only store (no Postgres catalog)
+
+```bash
+SIXCALL_USE_DB=0
+```
+
+Auth still needs `DATABASE_URL` if you use signup/login.
 
 ---
 
 ## API / CLI
 
-### Python API
+### Python
 
 ```python
 from app import ingest_pdf, ask, list_docs, get_trace
@@ -364,31 +274,28 @@ print(answer.status, answer.text, answer.calls_used)
 print(get_trace(answer.question_id))
 ```
 
-`Answer`: `{text, status, pages_used, tool_trace, calls_used, question_id, quotes, ...}`  
-`status` is `ok` or `insufficient_information`.
+`status`: `ok` | `insufficient_information`.
 
 ### CLI
 
 ```bash
-# Local JSON only (no database required for the demo)
 SIXCALL_USE_DB=0 python -m app.cli ingest path/to/file.pdf
 SIXCALL_USE_DB=0 python -m app.cli ask <doc_id> "What is the refund window?"
 python -m app.cli trace <question_id>
 python -m app.cli docs
+python -m app.cli migrate
 ```
-
-The ask view prints tool milliseconds and answer-model milliseconds separately. `python -m pytest -q` runs the suite, including the multi-page, supersede, absent, injection, single-generation, and zero-tool cases.
 
 ### HTTP (selected)
 
-| Method   | Path                          | Purpose                                    |
-| -------- | ----------------------------- | ------------------------------------------ |
-| `POST`   | `/auth/signup`, `/auth/login` | Account + token                            |
-| `POST`   | `/ingest`                     | Upload PDF                                 |
-| `GET`    | `/documents`                  | List owned docs                            |
-| `DELETE` | `/documents/{doc_id}`         | Delete one doc                             |
-| `POST`   | `/ask`                        | Ask (optional chat history for follow-ups) |
-| `GET`    | `/health`                     | Liveness + DB flag                         |
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| `POST` | `/auth/signup`, `/auth/login` | Account + token |
+| `POST` | `/ingest` | Upload PDF → `doc_id` (local-ready) |
+| `GET` | `/documents` | List owned docs |
+| `DELETE` | `/documents/{doc_id}` | Delete one |
+| `POST` | `/ask` | Budgeted Q&A |
+| `GET` | `/health` | Liveness |
 
 ---
 
@@ -398,23 +305,22 @@ The ask view prints tool milliseconds and answer-model milliseconds separately. 
 pytest -q
 ```
 
-Covered: 7th call blocked · `search_keyword` returns ints · agent does not import store · fabricated quotes rejected · empty search → insufficient information · stable `doc_id` for same bytes · follow-ups · query NLP.
+Covered: 7th call blocked · structure-first pins/sections · local-first ingest (DB sync non-blocking) · fabricated quotes rejected · empty search abstain · owner-scoped `doc_id` · no store import from agent.
 
-### Hardened (common silent misses)
+### Hardened
 
-- Unicode / PDF asterisks (`A∗` vs `A*`), ligatures (`ﬁ`), soft hyphens, NBSP, fancy dashes
-- Tech tokens: `A*`, `C++`, `C#`, `O(n…)`
-- Keyword aliases expanded _inside_ `search_keyword` (no extra tool-call budget)
-- OCR also triggered on CID/`U+FFFD` garbage pages
-- Extract flags dissolve ligatures + dehyphenate; inline TOC strip before hyphen joins
+- Unicode / PDF asterisks, ligatures, soft hyphens
+- Tech tokens: `A*`, `C++`, `C#`
+- Keyword aliases inside one `search_keyword` call
+- Near-span verify: RapidFuzz ≥90 with same digits/negations
 
 ### Still possible
 
-- **True synonym miss**: PDF says “termination”, query says “halting”
-- **Weak structure**: no TOC + uniform fonts → thin heading hints
-- **OCR gaps**: Tesseract missing or bad scans
-- **Budget**: multi-hop needing many pages under a 6-call cap → abstain
-- **LLM outage**: Gemini↔Groq fallback; total failure → insufficient information
+- Synonym miss (“termination” vs “halting”)
+- Weak outline (no TOC + uniform fonts)
+- OCR gaps when `SIXCALL_OCR=0`
+- Multi-hop needs more than 6 calls → abstain
+- Total LLM outage → insufficient information
 
 ### Dependencies
 
@@ -423,4 +329,4 @@ pymupdf, pymupdf4llm, litellm, python-dotenv, pydantic, rapidfuzz, snowballstemm
 nltk, pytest, fastapi, uvicorn, python-multipart, psycopg
 ```
 
-Query planning uses NLTK `word_tokenize(..., preserve_line=True)` and English stopwords from bundled `app/nltk_data` (no runtime downloads). Technical tokens and meaning-changing words (`not`, `before`, `after`) are preserved. Include `app/nltk_data` when packaging.
+NLTK data is bundled under `app/nltk_data` (no runtime downloads).
