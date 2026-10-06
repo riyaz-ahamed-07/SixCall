@@ -8,7 +8,7 @@ from app.agent.navigate import (
     apply_supersede_lock,
     choose_pages,
     match_sections,
-    optional_search_keeps_repair,
+    optional_search_keeps_reads,
 )
 from app.agent.pins import extract_pins, extract_question, term_allowed, term_in_question
 from app.agent.toc_pick import accept_toc_pick
@@ -34,6 +34,18 @@ def test_pins_are_substrings_and_do_not_invent_expansions():
     assert "refund window" in [p.lower() for p in again]
     assert "amendment" in [p.lower() for p in again]
     assert all(term_in_question(pin, longer) for pin in again)
+
+
+def test_pin_search_order_prefers_atoms_before_adjacency_phrases():
+    """Two-search budget must not burn a slot on a missable multi-word phrase first."""
+    pins = [p.lower() for p in extract_pins("what is the ascii value of 0")]
+    assert pins[:2] == ["ascii", "value"]
+    assert "ascii value" not in pins[:2]
+    ranked = [p.lower() for p in extract_question("what is the ascii value of 0").terms]
+    assert ranked.index("ascii") < ranked.index("ascii value")
+    assert ranked.index("value") < ranked.index("ascii value")
+
+
 
 
 def test_accept_toc_pick_drops_terms_not_in_the_extract():
@@ -89,8 +101,8 @@ def test_supersede_lock_replaces_lowest_page_when_the_window_is_full():
     locked = apply_supersede_lock([2, 3, 4], 40)
     assert locked == [2, 3, 40]
     assert apply_supersede_lock([2, 40], 40) == [2, 40]
-    assert optional_search_keeps_repair(3) is True
-    assert optional_search_keeps_repair(2) is False
+    assert optional_search_keeps_reads(3) is True
+    assert optional_search_keeps_reads(2) is False
 
 
 def test_supersede_lock_keeps_latest_hit_outside_the_section():
@@ -139,6 +151,39 @@ def test_precision_phrase_and_number_then_recall_for_stems(tmp_path):
     stemmed = store.search_keyword(rec.doc_id, "running")
     assert stemmed == [3, 4]
     assert all(isinstance(p, int) for p in stemmed)
+
+
+def test_multi_pin_search_ranks_full_overlap_then_pairs_then_singles(tmp_path):
+    """One call with a pin list: all-terms > adjacent pairs > singles."""
+    pages = {
+        1: "Shipping only. Nothing else here.",
+        2: "Hyper parameter tuning is covered without the model family.",
+        3: "An llm overview with no training knobs mentioned.",
+        4: "Hyper parameter llm settings control learning rate and batch size.",
+        5: "Unrelated appendix about printers.",
+    }
+    store = reset_store_for_tests(tmp_path / "docs")
+    rec = DocRecord(
+        doc_id="multipinrank0001",
+        meta={"page_count": 5, "title": "ml"},
+        pages=pages,
+        labels={},
+        headings=[],
+        index=build_inverted_index(pages),
+        precision_index=build_precision_index(pages),
+    )
+    store._docs[rec.doc_id] = rec
+    ranked = store.search_keyword(
+        rec.doc_id, ["hyper", "parameter", "llm", "hyper parameter"]
+    )
+    assert ranked[0] == 4
+    assert 2 in ranked
+    assert ranked.index(2) < ranked.index(3)
+    assert 1 not in ranked
+    assert 5 not in ranked
+    # Single-string path unchanged.
+    assert store.search_keyword(rec.doc_id, "llm") == [3, 4]
+
 
 
 def test_happy_path_skips_planner_when_headings_overlap(tmp_path, monkeypatch):
@@ -223,18 +268,30 @@ def test_weak_overlap_calls_planner_once_and_keeps_question_terms(tmp_path, monk
         for step in result["tool_trace"]
         if step["tool"] == "search_keyword"
     ]
+    flat = []
+    for kw in searched:
+        if isinstance(kw, list):
+            flat.extend(str(item) for item in kw)
+        else:
+            flat.append(str(kw))
     assert result["status"] == "ok"
     assert calls["n"] == 1
     assert result["timing"]["planner_used"] is True
     assert result["timing"]["llm_calls"] == 2
     assert searched
-    assert all("battery" not in str(kw).lower() for kw in searched)
-    assert all(term_in_question(str(kw), "What is the lunar freight warranty?") for kw in searched)
-    assert all(term_allowed(str(kw), extract_question("What is the lunar freight warranty?")) for kw in searched)
+    assert len(searched) == 1
+    assert all("battery" not in term.lower() for term in flat)
+    assert all(
+        term_in_question(term, "What is the lunar freight warranty?") for term in flat
+    )
+    assert all(
+        term_allowed(term, extract_question("What is the lunar freight warranty?"))
+        for term in flat
+    )
     clear_active_session()
 
 
-def test_flat_outline_extra_search_keeps_the_repair_slot(tmp_path, monkeypatch):
+def test_flat_outline_reads_before_single_failed_generation(tmp_path, monkeypatch):
     clear_active_session()
     quote = "The refund window is 14 days."
     pages = {
@@ -268,8 +325,7 @@ def test_flat_outline_extra_search_keeps_the_repair_slot(tmp_path, monkeypatch):
     def _draft(**kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            assert kwargs["budget_left"] >= 1
-            assert kwargs["unused_candidates"]
+            assert len(kwargs["pages"]) >= 2
             return {
                 "status": "insufficient_information",
                 "answer": "Need one more page.",
@@ -294,13 +350,19 @@ def test_flat_outline_extra_search_keeps_the_repair_slot(tmp_path, monkeypatch):
         for step in result["tool_trace"]
         if step["tool"] == "get_page"
     ]
-    assert result["status"] == "ok"
+    assert result["status"] == "insufficient_information"
     assert result["timing"]["planner_llm"] == 0
-    assert calls["n"] == 2
-    assert len(searched) == 2
+    assert calls["n"] == 1
+    assert len(searched) == 1
     assert len(fetched) >= 2
     assert result["calls_used"] <= 6
-    assert all(term_allowed(str(kw), extract) for kw in searched)
+    flat = []
+    for kw in searched:
+        if isinstance(kw, list):
+            flat.extend(str(item) for item in kw)
+        else:
+            flat.append(str(kw))
+    assert all(term_allowed(term, extract) for term in flat)
     clear_active_session()
 
 

@@ -33,7 +33,8 @@ export default function ThinkingState({
 }) {
   const [manualExpanded, setManualExpanded] = useState<boolean | null>(null);
   const [tick, setTick] = useState(0);
-  const autoExpanded = working || rows.length > 0;
+  // Open while working; stay collapsed after settle unless the user expands.
+  const autoExpanded = working;
   const expanded = manualExpanded ?? autoExpanded;
   const traceRef = useRef<HTMLDivElement>(null);
   const [lineHeight, setLineHeight] = useState(0);

@@ -40,7 +40,10 @@ MAX_TOOL_CALLS = max(1, min(6, _MAX_RAW))
 DOC_STORE_DIR = Path(os.getenv("DOC_STORE_DIR", str(_ROOT / ".data" / "docs")))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_CONNECT_TIMEOUT_SEC = float(os.getenv("DB_CONNECT_TIMEOUT_SEC", "5"))
-DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "8000"))
+# Short default for reads / auth; ingest writes override via DB_WRITE_TIMEOUT_MS.
+DB_STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "15000"))
+# Large PDFs (hundreds of pages + keyword_index) need a long write window.
+DB_WRITE_TIMEOUT_MS = int(os.getenv("DB_WRITE_TIMEOUT_MS", "180000"))
 # End-to-end ask deadline (planner + tools + one final generation).
 REQUEST_DEADLINE_SEC = float(os.getenv("REQUEST_DEADLINE_SEC", "15"))
 LLM_ATTEMPT_TIMEOUT_SEC = float(os.getenv("LLM_ATTEMPT_TIMEOUT_SEC", "12"))
@@ -52,3 +55,5 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_MODEL_FAST = os.getenv("GROQ_MODEL_FAST", "openai/gpt-oss-20b")
 # Prefer groq while testing / when Gemini is rate-limited. Values: groq | gemini
 LLM_PRIMARY = os.getenv("LLM_PRIMARY", "groq").strip().lower()
+# When DATABASE_URL is set, Postgres is the source of truth (local JSON is not a catalog).
+SIXCALL_USE_DB = os.getenv("SIXCALL_USE_DB", "auto").strip().lower()

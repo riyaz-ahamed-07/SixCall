@@ -6,6 +6,10 @@ venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-review-*/
+.pytest-review-focused/
+.pytest-review-tmp2/
+.review-snapshots/
 .mypy_cache/
 .data/
 *.egg-info/

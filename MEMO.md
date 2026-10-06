@@ -13,7 +13,7 @@
 
 | Constraint | Choice                                                                                |
 | ---------- | ------------------------------------------------------------------------------------- |
-| 6 calls    | Headings + at most two question pins, then `get_page`; one call held for repair      |
+| 6 calls    | Headings + at most two question pins, then `get_page`; selected pages read before one final generation      |
 | Navigation | Section tree + question pins + 6-call ledger + fail-closed span ids                  |
 | Grounding  | Span id must exist; exact or high string match with number and negation guards       |
 | Multi-user | Auth bearer + `owner_id` on documents/questions; clear-all is owner-scoped            |

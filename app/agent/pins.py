@@ -177,14 +177,38 @@ def extract_question(question: str) -> QuestionExtract:
             continue
         add(tok)
 
-    pins.sort(key=lambda p: (-len(p.split()), -len(p), p.lower()))
+    # Search atoms before speculative adjacency phrases so a miss on
+    # "ascii value" cannot burn the only early search slot before "ascii".
+    pins.sort(key=_search_rank)
     extract.terms = pins[:_TERM_CAP]
     return extract
 
 
 def extract_pins(question: str, *, limit: int = 4) -> list[str]:
-    """Distinctive phrases and words copied from the question, longest first."""
+    """Distinctive phrases and words copied from the question, search-ranked."""
     return extract_question(question).terms[:limit]
+
+
+def _search_rank(pin: str) -> tuple:
+    """Lower tuple searches earlier under the two-search budget.
+
+    1. Numbers-with-units / clause-like / tech tokens (precision-friendly)
+    2. Single content words (longer first); bare short digits after words
+    3. Multi-word adjacency phrases last (often absent as exact phrases)
+    """
+    text = (pin or "").strip()
+    words = text.split()
+    n = len(words)
+    digitish = any(ch.isdigit() for ch in text) or any(ch in text for ch in "*+#/")
+    digits_only = text.replace(".", "").isdigit()
+    bare_short_num = n == 1 and digits_only and len(text.replace(".", "")) <= 2
+    if digitish and not bare_short_num:
+        return (0, 0 if n == 1 else 1, -len(text), text.lower())
+    if n == 1 and not bare_short_num:
+        return (1, 0, -len(text), text.lower())
+    if bare_short_num:
+        return (1, 1, -len(text), text.lower())
+    return (2, 0, -len(text), text.lower())
 
 
 def _keep_unigram(tok: str) -> bool:

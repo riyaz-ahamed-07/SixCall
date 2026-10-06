@@ -100,7 +100,10 @@ async function request<T>(
     });
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") {
-      throw new Error("Request timed out — try a shorter question or retry");
+      const label = path.includes("/ingest")
+        ? "Upload timed out — large PDFs can take 1–2 minutes (parse + DB save). Retry, or keep the doc if it already appears in the list."
+        : "Request timed out — try a shorter question or retry";
+      throw new Error(label);
     }
     throw new Error(
       "Cannot reach API at http://127.0.0.1:8000. Start it with: uvicorn app.server:app --port 8000",
@@ -185,6 +188,7 @@ export function clearDocuments() {
 export async function ingestPdf(file: File) {
   const body = new FormData();
   body.append("file", file);
+  // Judging textbooks (600+ pages) need several minutes for pymupdf4llm.
   return request<{ doc_id: string; filename: string }>(
     "/ingest",
     {
@@ -192,7 +196,7 @@ export async function ingestPdf(file: File) {
       body,
     },
     undefined,
-    60_000,
+    600_000,
   );
 }
 

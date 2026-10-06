@@ -83,13 +83,21 @@ def delete_all_documents(*, owner_id: str | None = None) -> int:
 
 
 def save_document(rec: DocRecord) -> None:
+    """Persist document + pages + headings to Postgres (source of truth)."""
     if not db_enabled():
-        return
+        raise RuntimeError("DATABASE_URL is not set; cannot save document to DB")
+    from app.db.connection import connect_write
+    from psycopg.types.json import Jsonb
+
     meta = dict(rec.meta or {})
+    # Keep precision_index inside meta so DB reloads don't lose dual-index search.
+    if rec.precision_index:
+        meta["precision_index"] = rec.precision_index
     title = str(meta.get("source_name") or meta.get("title") or rec.doc_id)
     owner_raw = meta.get("owner_id")
     owner_id = str(owner_raw) if owner_raw and str(owner_raw) != "local" else None
-    with connect() as conn:
+
+    with connect_write() as conn:
         conn.execute(
             """
             INSERT INTO documents (
@@ -97,7 +105,7 @@ def save_document(rec: DocRecord) -> None:
                 meta, keyword_index, updated_at
             ) VALUES (
                 %(doc_id)s, %(owner_id)s::uuid, %(title)s, %(source_name)s, %(source_path)s,
-                %(page_count)s, %(meta)s::jsonb, %(keyword_index)s::jsonb, NOW()
+                %(page_count)s, %(meta)s, %(keyword_index)s, NOW()
             )
             ON CONFLICT (doc_id) DO UPDATE SET
                 owner_id = COALESCE(EXCLUDED.owner_id, documents.owner_id),
@@ -116,50 +124,50 @@ def save_document(rec: DocRecord) -> None:
                 "source_name": meta.get("source_name"),
                 "source_path": meta.get("source_path"),
                 "page_count": int(meta.get("page_count") or len(rec.pages)),
-                "meta": json.dumps(meta, ensure_ascii=False),
-                "keyword_index": json.dumps(rec.index, ensure_ascii=False),
+                "meta": Jsonb(meta),
+                "keyword_index": Jsonb(rec.index or {}),
             },
         )
         conn.execute("DELETE FROM pages WHERE doc_id = %s", (rec.doc_id,))
         if rec.pages:
             with conn.cursor() as cur:
-                cur.executemany(
-                    """
-                    INSERT INTO pages (doc_id, page_number, body, label)
-                    VALUES (%(doc_id)s, %(page_number)s, %(body)s, %(label)s)
-                    """,
-                    [
-                        {
-                            "doc_id": rec.doc_id,
-                            "page_number": page_no,
-                            "body": text,
-                            "label": rec.labels.get(page_no, str(page_no)),
-                        }
-                        for page_no, text in rec.pages.items()
-                    ],
-                )
+                with cur.copy(
+                    "COPY pages (doc_id, page_number, body, label) FROM STDIN"
+                ) as copy:
+                    for page_no, text in sorted(rec.pages.items()):
+                        copy.write_row(
+                            (
+                                rec.doc_id,
+                                int(page_no),
+                                text or "",
+                                str(rec.labels.get(page_no, page_no)),
+                            )
+                        )
         conn.execute("DELETE FROM headings WHERE doc_id = %s", (rec.doc_id,))
         if rec.headings:
             with conn.cursor() as cur:
-                cur.executemany(
-                    """
-                    INSERT INTO headings (doc_id, ord, title, level, start_page, end_page)
-                    VALUES (%(doc_id)s, %(ord)s, %(title)s, %(level)s, %(start_page)s, %(end_page)s)
-                    """,
-                    [
-                        {
-                            "doc_id": rec.doc_id,
-                            "ord": i,
-                            "title": h.title,
-                            "level": h.level,
-                            "start_page": h.start,
-                            "end_page": h.end,
-                        }
-                        for i, h in enumerate(rec.headings)
-                    ],
-                )
+                with cur.copy(
+                    "COPY headings (doc_id, ord, title, level, start_page, end_page) FROM STDIN"
+                ) as copy:
+                    for i, h in enumerate(rec.headings):
+                        copy.write_row(
+                            (
+                                rec.doc_id,
+                                i,
+                                h.title,
+                                int(h.level),
+                                int(h.start),
+                                int(h.end),
+                            )
+                        )
         conn.commit()
-    logger.info("db_save_document doc_id=%s pages=%d", rec.doc_id, len(rec.pages))
+    logger.info(
+        "db_save_document doc_id=%s pages=%d headings=%d index_terms=%d",
+        rec.doc_id,
+        len(rec.pages),
+        len(rec.headings),
+        len(rec.index or {}),
+    )
 
 
 def load_all_documents(*, owner_id: str | None = None) -> list[DocRecord]:
@@ -212,6 +220,12 @@ def load_all_documents(*, owner_id: str | None = None) -> list[DocRecord]:
                 )
                 for r in headings_rows
             ]
+            precision_raw = meta.get("precision_index") if isinstance(meta, dict) else None
+            precision_index = (
+                {k: list(v) for k, v in precision_raw.items()}
+                if isinstance(precision_raw, dict)
+                else {}
+            )
             out.append(
                 DocRecord(
                     doc_id=doc_id,
@@ -220,6 +234,7 @@ def load_all_documents(*, owner_id: str | None = None) -> list[DocRecord]:
                     labels=labels,
                     headings=headings,
                     index={k: list(v) for k, v in (index or {}).items()},
+                    precision_index=precision_index,
                 )
             )
     logger.info("db_load_documents count=%d", len(out))

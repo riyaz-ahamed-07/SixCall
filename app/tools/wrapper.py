@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.config import DOC_STORE_DIR, MAX_TOOL_CALLS
+from app.logging_setup import short
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,15 @@ class ToolSession:
             )
 
         self.calls_used = next_index
+        arg_preview = _args_preview(tool_name, kwargs)
+        logger.info(
+            "tool #%d/%d -> %s %s  qid=%s",
+            next_index,
+            self.max_calls,
+            tool_name,
+            arg_preview,
+            self.question_id,
+        )
         started = time.perf_counter()
         try:
             result = fn(**kwargs)
@@ -109,13 +119,13 @@ class ToolSession:
             self.trace.append(record)
             _persist_record_safe(record)
             logger.info(
-                "tool_call qid=%s n=%s tool=%s budget_left=%s elapsed_ms=%.2f error=%s",
-                self.question_id,
+                "tool #%d/%d FAIL %s -> %s  %.0fms  qid=%s",
                 next_index,
+                self.max_calls,
                 tool_name,
-                self.budget_left,
-                elapsed_ms,
                 type(exc).__name__,
+                elapsed_ms,
+                self.question_id,
             )
             raise
 
@@ -135,12 +145,13 @@ class ToolSession:
             elapsed_ms=elapsed_ms,
         )
         logger.info(
-            "tool_call qid=%s n=%s tool=%s budget_left=%s elapsed_ms=%.2f",
-            self.question_id,
+            "tool #%d/%d OK  %s -> %s  %.0fms  qid=%s",
             next_index,
+            self.max_calls,
             tool_name,
-            self.budget_left,
+            short(_summarize(tool_name, result), limit=100),
             elapsed_ms,
+            self.question_id,
         )
         self.trace.append(record)
         _persist_record_safe(record)
@@ -279,3 +290,16 @@ def _summarize(tool_name: str, result: Any) -> str:
         items = list(result or [])
         return f"count={len(items)}"
     return repr(result)[:200]
+
+
+def _args_preview(tool_name: str, kwargs: dict[str, Any]) -> str:
+    if tool_name == "get_page":
+        return f"page={kwargs.get('page_number') or kwargs.get('page')}"
+    if tool_name == "search_keyword":
+        kw = kwargs.get("keyword")
+        return f"keyword={short(kw if not isinstance(kw, list) else kw, limit=60)}"
+    if tool_name in ("list_headings", "list_documents"):
+        return f"doc={short(kwargs.get('doc_id'), limit=16)}"
+    skip = {"doc_id"}
+    parts = [f"{k}={short(v, limit=40)}" for k, v in kwargs.items() if k not in skip]
+    return " ".join(parts[:4]) or "-"

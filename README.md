@@ -189,16 +189,13 @@ sequenceDiagram
   Note over A: pins copied from the question<br/>heading-title overlap
   A->>T: search_keyword (precision, else recall)
   T-->>A: page numbers
-  A->>T: get_page (reserve one repair slot)
+  A->>T: get_page (selected pages within budget)
   T-->>A: page text
   Note over A: spans built here, with stable ids
   A->>Ans: one answer, cite span ids
   A->>V: id exists, numbers and negations agree
   alt verified
     A-->>U: status=ok
-  else repair budget remains
-    A->>T: one more get_page
-    A->>Ans: one more answer
   else no evidence
     A-->>U: insufficient information
   end
@@ -380,7 +377,7 @@ python -m app.cli trace <question_id>
 python -m app.cli docs
 ```
 
-The ask view prints tool milliseconds and answer-model milliseconds separately. `python -m pytest -q` runs the suite, including the multi-page, supersede, absent, injection, repair, and zero-tool cases.
+The ask view prints tool milliseconds and answer-model milliseconds separately. `python -m pytest -q` runs the suite, including the multi-page, supersede, absent, injection, single-generation, and zero-tool cases.
 
 ### HTTP (selected)
 

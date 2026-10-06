@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import re
-import tempfile
 import time
 from pathlib import Path
 from typing import Annotated, Any
@@ -14,26 +13,58 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
-from app.api import ask, get_trace, ingest_pdf, list_docs, overview
+from app.api import ask, get_trace, list_docs, overview
 from app.db.connection import db_enabled
 from app.deps import bearer_token, require_user
+from app.logging_setup import configure_logging, short, step
 from app.store.document_store import PageNotFoundError, get_store
 
+configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="SixCall", version="0.1.0")
+
+# Paths where full request timing helps; skip OPTIONS/health noise.
+_TIMED_PATHS = {
+    "/ingest",
+    "/ask",
+    "/overview",
+    "/auth/login",
+    "/auth/signup",
+    "/documents",
+}
 
 
 @app.middleware("http")
 async def request_timing(request: Request, call_next):
     started = time.perf_counter()
+    path = request.url.path
+    track = request.method != "OPTIONS" and (
+        path in _TIMED_PATHS or path.startswith("/documents/")
+    )
+    if track:
+        step("HTTP", f"{request.method} {path} start")
     try:
         response = await call_next(request)
-        response.headers["Server-Timing"] = f"total;dur={(time.perf_counter() - started) * 1000:.1f}"
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        response.headers["Server-Timing"] = f"total;dur={elapsed_ms:.1f}"
+        if track:
+            step(
+                "HTTP",
+                f"{request.method} {path} -> {response.status_code}",
+                elapsed_ms=elapsed_ms,
+            )
         return response
-    finally:
-        logger.info("request_timing method=%s path=%s elapsed_ms=%.1f",
-                    request.method, request.url.path, (time.perf_counter() - started) * 1000)
+    except Exception as exc:
+        if track:
+            step(
+                "HTTP",
+                f"{request.method} {path} FAIL",
+                level=logging.ERROR,
+                error=type(exc).__name__,
+                elapsed_ms=(time.perf_counter() - started) * 1000,
+            )
+        raise
 
 app.add_middleware(
     CORSMiddleware,
@@ -202,6 +233,7 @@ def ingest(user: UserDep, file: UploadFile = File(...)) -> dict[str, str]:
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF uploads are supported")
 
+    t0 = time.perf_counter()
     raw = file.file.read(_MAX_UPLOAD_BYTES + 1)
     if len(raw) > _MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="PDF exceeds 25MB limit")
@@ -209,22 +241,43 @@ def ingest(user: UserDep, file: UploadFile = File(...)) -> dict[str, str]:
         raise HTTPException(status_code=400, detail="File does not look like a PDF")
 
     display_name = Path(file.filename).name[:180]
-    suffix = Path(display_name).suffix or ".pdf"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(raw)
-        tmp_path = tmp.name
-
+    owner = _owner_id(user)
+    step(
+        "INGEST",
+        "upload received",
+        file=display_name,
+        bytes=len(raw),
+        owner=short(owner, limit=12),
+        read_ms=(time.perf_counter() - t0) * 1000,
+    )
     try:
-        try:
-            doc_id = ingest_pdf(tmp_path, owner_id=_owner_id(user), source_name=display_name)
-        except Exception as exc:
-            logger.exception("ingest_failed error=%s", type(exc).__name__)
-            raise HTTPException(
-                status_code=500, detail=f"Ingest failed: {type(exc).__name__}"
-            ) from None
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        # Bytes path: duplicate owner+content reuses store (no temp file / no re-parse).
+        doc_id = get_store().ingest_bytes(
+            raw,
+            owner_id=owner,
+            source_name=display_name,
+        )
+    except Exception as exc:
+        step(
+            "INGEST",
+            "FAILED",
+            level=logging.ERROR,
+            file=display_name,
+            error=type(exc).__name__,
+            elapsed_ms=(time.perf_counter() - t0) * 1000,
+        )
+        logger.exception("ingest_failed error=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=500, detail=f"Ingest failed: {type(exc).__name__}"
+        ) from None
 
+    step(
+        "INGEST",
+        "DONE",
+        doc_id=doc_id,
+        file=display_name,
+        elapsed_ms=(time.perf_counter() - t0) * 1000,
+    )
     return {"doc_id": doc_id, "filename": display_name}
 
 
@@ -232,6 +285,13 @@ def ingest(user: UserDep, file: UploadFile = File(...)) -> dict[str, str]:
 def ask_question(body: AskRequest, user: UserDep) -> dict[str, Any]:
     owner = _owner_id(user)
     _require_owned_doc(body.doc_id, owner)
+    step(
+        "ASK",
+        "route",
+        doc=body.doc_id,
+        q=short(body.question),
+        history=len(body.history or []),
+    )
     try:
         answer = ask(
             body.doc_id,
@@ -239,8 +299,17 @@ def ask_question(body: AskRequest, user: UserDep) -> dict[str, Any]:
             history=body.history,
             owner_id=owner,
         )
-    except Exception:
+    except Exception as exc:
+        step("ASK", "route FAIL", level=logging.ERROR, error=type(exc).__name__)
         raise HTTPException(status_code=500, detail="Agent failed") from None
+    step(
+        "ASK",
+        "route done",
+        status=answer.status,
+        calls=answer.calls_used,
+        pages=answer.pages_used,
+        qid=answer.question_id,
+    )
     return answer.model_dump()
 
 

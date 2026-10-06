@@ -156,7 +156,7 @@ def apply_supersede_lock(fetch: list[int], latest: int | None) -> list[int]:
 
     Later statement supersedes earlier. A section filter must not drop that
     page. When the window is full, drop the lowest-priority non-latest page
-    so the repair slot is not stolen.
+    so evidence reads stay within the budget.
     """
     pages = [int(p) for p in fetch]
     if latest is None:
@@ -170,8 +170,8 @@ def apply_supersede_lock(fetch: list[int], latest: int | None) -> list[int]:
     return [*pages[:-1], latest]
 
 
-def optional_search_keeps_repair(budget_left: int) -> bool:
-    """True when one more search still leaves a page read and a repair slot."""
+def optional_search_keeps_reads(budget_left: int) -> bool:
+    """True when one more search still leaves at least two evidence reads."""
     return budget_left >= 3
 
 
@@ -206,22 +206,6 @@ def _cover(
 
 
 def select_initial_pages(ranked: list[int], budget_left: int, *, wide: bool) -> list[int]:
-    """Pages to read before the first answer.
-
-    Default window is min(budget, 3). Multi / compare / supersede may use 4.
-    When more candidates remain, hold one call for a repair get_page.
-    """
-    if budget_left <= 0 or not ranked:
-        return []
+    """Read the affordable selected pages before the only final generation."""
     limit = 4 if wide else 3
-    slots = min(budget_left, limit, len(ranked))
-    if len(ranked) > slots and budget_left - slots > 1:
-        slots = min(len(ranked), budget_left - 1, 4)
-    if (
-        budget_left >= 2
-        and len(ranked) > slots
-        and budget_left - slots == 0
-        and slots > 1
-    ):
-        slots -= 1
-    return ranked[:slots]
+    return list(dict.fromkeys(ranked))[:max(0, min(budget_left, limit))]

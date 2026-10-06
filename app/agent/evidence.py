@@ -305,76 +305,11 @@ def repair_quotes(
     quotes: list[dict[str, Any]],
     pages: dict[int, str],
 ) -> list[dict[str, Any]]:
-    """Replace unverifiable free-text quotes with overlapping evidence spans."""
-    from app.agent.verifier import quote_matches_page
+    """Compatibility helper: reject the whole batch rather than replace evidence.
 
-    spans = build_evidence_spans(pages)
-    if not quotes and not spans:
-        return []
+    Substituting a source span cannot repair the accompanying answer's meaning.
+    """
+    from app.agent.verifier import verify_quotes
 
-    repaired: list[dict[str, Any]] = []
-    for q in quotes or []:
-        text = str(q.get("text") or "").strip()
-        try:
-            page = int(q.get("page"))
-        except (TypeError, ValueError):
-            continue
-        source = pages.get(page)
-        if source is None:
-            continue
-        if text and quote_matches_page(text, source):
-            repaired.append(
-                {"text": text, "page": page, **({"id": q["id"]} if q.get("id") else {})}
-            )
-            continue
-        page_spans = [s for s in spans if int(s["page"]) == page]
-        best = _best_overlap_span(text, page_spans)
-        if best is None and looks_like_code(text):
-            code_spans = [
-                s for s in page_spans if looks_like_code(str(s.get("text") or ""))
-            ]
-            best = code_spans[0] if code_spans else None
-        if best is not None:
-            repaired.append(
-                {"text": best["text"], "page": best["page"], "id": best["id"]}
-            )
-
-    if repaired:
-        return repaired
-
-    if not any(looks_like_code(str(q.get("text") or "")) for q in (quotes or [])):
-        return []
-    codeish = [s for s in spans if looks_like_code(str(s.get("text") or ""))]
-    picked = codeish[:2]
-    return [{"text": s["text"], "page": s["page"], "id": s["id"]} for s in picked]
-
-
-def _best_overlap_span(
-    needle: str, page_spans: list[dict[str, Any]]
-) -> dict[str, Any] | None:
-    from app.agent.verifier import _norm_for_match
-
-    n = _norm_for_match(needle)
-    if not n or not page_spans:
-        return None
-    best: dict[str, Any] | None = None
-    best_score = 0
-    for s in page_spans:
-        t = _norm_for_match(str(s.get("text") or ""))
-        if not t:
-            continue
-        if n in t or t in n:
-            score = min(len(n), len(t))
-            if score > best_score:
-                best = s
-                best_score = score
-                continue
-        n_toks = set(n.split())
-        t_toks = set(t.split())
-        if len(n_toks) < 2:
-            continue
-        overlap = len(n_toks & t_toks)
-        if overlap >= max(2, len(n_toks) // 2) and overlap > best_score:
-            best = s
-            best_score = overlap
-    return best
+    ok, _ = verify_quotes(quotes, pages)
+    return [dict(q) for q in quotes] if ok else []

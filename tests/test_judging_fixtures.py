@@ -225,7 +225,7 @@ def test_fixture_injection_is_flagged_and_not_followed(tmp_path, monkeypatch):
     clear_active_session()
 
 
-def test_fixture_repair_get_page_runs_after_failed_draft(tmp_path, monkeypatch):
+def test_fixture_failed_draft_abstains_without_second_generation(tmp_path, monkeypatch):
     clear_active_session()
     quote = "The refund window is 14 days."
     pages = {i: f"Alpha section page {i} background. {quote}" for i in range(1, 8)}
@@ -239,8 +239,7 @@ def test_fixture_repair_get_page_runs_after_failed_draft(tmp_path, monkeypatch):
     def _draft(**kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            assert kwargs["budget_left"] >= 1
-            assert kwargs["unused_candidates"]
+            assert len(kwargs["pages"]) >= 2
             return {
                 "status": "insufficient_information",
                 "answer": "The first read does not settle the window.",
@@ -256,8 +255,8 @@ def test_fixture_repair_get_page_runs_after_failed_draft(tmp_path, monkeypatch):
     monkeypatch.setattr("app.agent.loop.draft_answer", _draft)
     result = run_agent(doc_id, "Where is alpha?")
     fetched = _get_pages(result["tool_trace"])
-    assert result["status"] == "ok"
-    assert calls["n"] == 2
+    assert result["status"] == "insufficient_information"
+    assert calls["n"] == 1
     assert len(fetched) >= 2
     assert result["calls_used"] > 0
     assert result["calls_used"] <= 6

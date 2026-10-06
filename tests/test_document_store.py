@@ -35,7 +35,42 @@ def test_ingest_deterministic_and_idempotent(tmp_path: Path) -> None:
     assert store.get_page(a, 1)
 
 
-def test_ingest_pymupdf4llm_keeps_searchable_text_and_table_digits(tmp_path: Path) -> None:
+def test_ingest_bytes_owner_duplicate_skips_reparse(tmp_path: Path, monkeypatch) -> None:
+    store = reset_store_for_tests(tmp_path / "docs")
+    pdf = tmp_path / "cs.pdf"
+    _make_pdf(pdf, ["Computer Science is about problem solving."])
+    raw = pdf.read_bytes()
+    first = store.ingest_bytes(raw, owner_id="user-a", source_name="cs.pdf")
+
+    calls = {"n": 0}
+    import app.store.document_store as ds
+
+    real_open = ds.fitz.open
+
+    def counting_open(*args, **kwargs):
+        calls["n"] += 1
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(ds.fitz, "open", counting_open)
+    second = store.ingest_bytes(raw, owner_id="user-a", source_name="cs.pdf")
+    assert second == first
+    assert calls["n"] == 0
+
+
+def test_ingest_bytes_different_owners_stay_isolated(tmp_path: Path) -> None:
+    store = reset_store_for_tests(tmp_path / "docs")
+    pdf = tmp_path / "cs.pdf"
+    _make_pdf(pdf, ["Computer Science is about problem solving."])
+    raw = pdf.read_bytes()
+    a = store.ingest_bytes(raw, owner_id="user-a", source_name="cs.pdf")
+    b = store.ingest_bytes(raw, owner_id="user-b", source_name="cs.pdf")
+    assert a != b
+
+
+def test_ingest_pymupdf4llm_keeps_searchable_text_and_table_digits(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("SIXCALL_MARKDOWN_EXTRACT", "1")
     store = reset_store_for_tests(tmp_path / "docs")
     pdf = tmp_path / "table.pdf"
     doc = fitz.open()
@@ -121,3 +156,100 @@ def test_corrupt_json_skipped(tmp_path: Path) -> None:
     (docs / "bad.json").write_text("{not-json", encoding="utf-8")
     store = reset_store_for_tests(docs)
     assert store.list_documents() == []
+
+
+def test_ingest_writes_local_cache_before_db_and_does_not_block(tmp_path: Path, monkeypatch) -> None:
+    """Upload returns after local JSON; remote DB sync runs in the background."""
+    import json
+    import threading
+    import time
+
+    from app.store.document_store import DocumentStore
+
+    monkeypatch.setattr("app.db.connection.db_enabled", lambda: True)
+    monkeypatch.setattr("app.db.repository.load_all_documents", lambda **kw: [])
+
+    started = threading.Event()
+    finished = threading.Event()
+
+    def slow_save(rec) -> None:
+        started.set()
+        time.sleep(0.5)
+        finished.set()
+
+    monkeypatch.setattr("app.db.repository.save_document", slow_save)
+
+    store = DocumentStore(tmp_path / "docs", use_db=True)
+    pdf = tmp_path / "policy.pdf"
+    _make_pdf(pdf, ["Refund window is 14 days."])
+    raw = pdf.read_bytes()
+
+    doc_id = store.ingest_bytes(raw, owner_id="user-a", source_name="policy.pdf")
+
+    # Must not wait for the 0.5s DB write — local cache is enough to return.
+    assert not finished.is_set(), "ingest blocked until DB save finished"
+    cache = tmp_path / "docs" / f"{doc_id}.json"
+    assert cache.is_file()
+    payload = json.loads(cache.read_text(encoding="utf-8"))
+    assert "pages" in payload and payload["pages"]
+    assert store.get(doc_id) is not None
+    # Ask path keeps using local memory even while/after DB sync.
+    assert store.get_page(doc_id, 1)
+
+    assert started.wait(2.0), "background DB sync never started"
+    assert finished.wait(2.0), "background DB sync never finished"
+    assert store.get(doc_id) is not None
+
+
+def test_store_startup_does_not_block_on_remote_hydrate(tmp_path: Path, monkeypatch) -> None:
+    """Local catalogs load sync; Supabase hydrate must not hold DocumentStore().__init__."""
+    import threading
+    import time
+
+    from app.store.document_store import DocumentStore
+
+    monkeypatch.setattr("app.db.connection.db_enabled", lambda: True)
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_load(**kw):
+        started.set()
+        release.wait(2.0)
+        return []
+
+    monkeypatch.setattr("app.db.repository.load_all_documents", slow_load)
+
+    t0 = time.perf_counter()
+    store = DocumentStore(tmp_path / "docs", use_db=True)
+    assert (time.perf_counter() - t0) < 0.5
+    assert started.wait(1.0), "background hydrate never started"
+    release.set()
+    assert isinstance(store._docs, dict)
+
+
+def test_ingest_reuses_disk_cache_without_reparse(tmp_path: Path, monkeypatch) -> None:
+    """Same owner+bytes after memory wipe reloads local JSON — no pymupdf reopen."""
+    store = reset_store_for_tests(tmp_path / "docs")
+    pdf = tmp_path / "cs.pdf"
+    _make_pdf(pdf, ["Computer Science is about problem solving."])
+    raw = pdf.read_bytes()
+    first = store.ingest_bytes(raw, owner_id="user-a", source_name="cs.pdf")
+    assert (tmp_path / "docs" / f"{first}.json").is_file()
+
+    store._docs.clear()
+
+    calls = {"n": 0}
+    import app.store.document_store as ds
+
+    real_open = ds.fitz.open
+
+    def counting_open(*args, **kwargs):
+        calls["n"] += 1
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(ds.fitz, "open", counting_open)
+    second = store.ingest_bytes(raw, owner_id="user-a", source_name="cs.pdf")
+    assert second == first
+    assert calls["n"] == 0
+    assert store.get(first) is not None

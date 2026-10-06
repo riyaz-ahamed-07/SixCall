@@ -121,7 +121,7 @@ class LLMClient:
                         "elapsed_ms": int((time.monotonic() - started) * 1000),
                     }
                 )
-                logger.info("llm_complete model=%s elapsed_ms=%.1f", model, (time.monotonic() - started) * 1000)
+                logger.info("llm OK model=%s elapsed_ms=%.0f", model, (time.monotonic() - started) * 1000)
                 return text
             except DeadlineExceededError:
                 self.last_attempts.append(
@@ -144,9 +144,10 @@ class LLMClient:
                     }
                 )
                 logger.info(
-                    "llm_attempt_failed model=%s err=%s",
+                    "llm FAIL model=%s err=%s elapsed_ms=%.0f",
                     model,
                     type(exc).__name__,
+                    (time.monotonic() - started) * 1000,
                 )
                 if _is_transient(exc) and attempts < limit:
                     time.sleep(0.05)

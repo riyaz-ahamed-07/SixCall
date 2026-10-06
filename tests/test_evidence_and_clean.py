@@ -152,7 +152,7 @@ def test_evidence_keeps_code_lines_intact():
     assert failures == []
 
 
-def test_repair_quotes_maps_paraphrase_to_code_span():
+def test_repair_quotes_rejects_paraphrase_instead_of_substituting_code():
     from app.agent.evidence import repair_quotes
 
     pages = {
@@ -162,7 +162,4 @@ def test_repair_quotes_maps_paraphrase_to_code_span():
         [{"text": "open a.csv with fopen", "page": 1}],
         pages,
     )
-    assert repaired
-    ok, failures = verify_quotes(repaired, pages)
-    assert ok is True
-    assert failures == []
+    assert repaired == []

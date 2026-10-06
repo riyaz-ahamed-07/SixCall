@@ -98,7 +98,7 @@ def build_precision_index(pages: dict[int, str]) -> dict[str, list[int]]:
 def precision_lookup(index: dict[str, list[int]], keyword: str) -> list[int] | None:
     """Return precision pages, or None so the caller can fall back to recall.
 
-    A lowercase single word is not answered from the CapWord postings. Those
+    An alphabetic single word is not answered from the CapWord postings. Those
     postings only record capitalized forms, so using them alone would hide
     later lowercase mentions of the same word.
     """
@@ -113,7 +113,6 @@ def precision_lookup(index: dict[str, list[int]], keyword: str) -> list[int] | N
         " " in low
         or any(ch.isdigit() for ch in low)
         or any(ch in low for ch in "*+#")
-        or any(ch.isupper() for ch in raw)
     )
     if not distinctive:
         return None

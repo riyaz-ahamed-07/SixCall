@@ -99,7 +99,20 @@ class SearchKeywordArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     doc_id: str = Field(min_length=1)
-    keyword: str
+    keyword: str | list[str]
+
+    @field_validator("keyword", mode="before")
+    @classmethod
+    def _keyword(cls, value: Any) -> str | list[str]:
+        if isinstance(value, (list, tuple)):
+            pins = [str(item).strip() for item in value if str(item or "").strip()]
+            if not pins:
+                raise ValueError("keyword list must not be empty")
+            return pins
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("keyword must not be blank")
+        return text
 
 
 class GetPageArgs(BaseModel):

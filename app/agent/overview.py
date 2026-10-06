@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from typing import Any
@@ -9,6 +10,7 @@ from app.agent.answerer import draft_answer
 from app.agent.verifier import verify_quotes
 from app.config import REQUEST_DEADLINE_SEC
 from app.deadline import DeadlineExceededError, clear_deadline, start_deadline
+from app.logging_setup import short, step
 from app.tools.get_page import get_page
 from app.tools.list_headings import list_headings
 from app.tools.wrapper import (
@@ -226,11 +228,13 @@ def run_light_summary(doc_id: str) -> dict[str, Any]:
     start_deadline(REQUEST_DEADLINE_SEC)
     session = start_question(question_id, doc_id=doc_id)
     strategy = "light_summary"
+    step("OVERVIEW", "START light", qid=question_id, doc=doc_id)
 
     def _insufficient(reason: str, *, status_reason: str | None = None) -> dict[str, Any]:
         clear_active_session()
         clear_deadline()
         text, support = format_abstain_text(reason)
+        step("OVERVIEW", "DONE light insufficient", qid=question_id, reason=short(reason, limit=80))
         return {
             "text": text,
             "status": "insufficient_information",
@@ -356,6 +360,7 @@ def run_light_summary(doc_id: str) -> dict[str, Any]:
 
         clear_active_session()
         clear_deadline()
+        step("OVERVIEW", "DONE light ok", qid=question_id, calls=session.calls_used)
         return {
             "text": answer,
             "status": "ok",
@@ -395,12 +400,20 @@ def run_overview(doc_id: str, question: str | None = None) -> dict[str, Any]:
     fetched: dict[int, str] = {}
     strategy = "overview"
     page_count = 1
+    step("OVERVIEW", "START", qid=question_id, doc=doc_id, q=short(question))
 
     def _insufficient(reason: str, *, status_reason: str | None = None) -> dict[str, Any]:
         fetched.clear()
         clear_active_session()
         clear_deadline()
         text, support = format_abstain_text(reason)
+        step(
+            "OVERVIEW",
+            "DONE insufficient",
+            qid=question_id,
+            reason=short(reason, limit=120),
+            calls=session.calls_used,
+        )
         return {
             "text": text,
             "status": "insufficient_information",
@@ -489,21 +502,21 @@ def run_overview(doc_id: str, question: str | None = None) -> dict[str, Any]:
         quotes = list(draft.get("quotes") or [])
         ok, failures = verify_quotes(quotes, fetched)
         if not ok:
-            from app.agent.evidence import repair_quotes
-
-            repaired = repair_quotes(quotes, fetched)
-            ok2, failures2 = verify_quotes(repaired, fetched)
-            if not ok2:
-                return _insufficient(
-                    "quote verification failed: "
-                    + "; ".join((failures2 or failures)[:3]),
-                    status_reason="invalid_output",
-                )
-            quotes = repaired
+            return _insufficient(
+                "quote verification failed: " + "; ".join(failures[:3]),
+                status_reason="invalid_output",
+            )
 
         fetched.clear()
         clear_active_session()
         clear_deadline()
+        step(
+            "OVERVIEW",
+            "DONE ok",
+            qid=question_id,
+            calls=session.calls_used,
+            pages=sorted(set(pages_used)),
+        )
         return {
             "text": draft.get("answer") or "",
             "status": "ok",

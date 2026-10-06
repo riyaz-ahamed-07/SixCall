@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
@@ -32,6 +34,11 @@ except Exception:  # pragma: no cover - optional
     _STEMMER = None
 
 logger = logging.getLogger(__name__)
+
+# Same owner+bytes re-upload while a parse is mid-flight joins this gate
+# instead of starting a second pymupdf pass.
+_INGEST_GATES: dict[str, threading.Event] = {}
+_INGEST_GATE_LOCK = threading.Lock()
 
 _HEADING_NUM_RE = re.compile(r"^\d+(\.\d+)*\s+\S")
 _HYPHEN_BREAK_RE = re.compile(r"([a-z])-\n([a-z])")
@@ -176,13 +183,23 @@ def _extract_flags() -> int:
     return flags
 
 
-def _markdown_by_page(doc: fitz.Document) -> dict[int, str]:
-    """Markdown page bodies from pymupdf4llm.
+def _markdown_extract_enabled(page_count: int) -> bool:
+    """Plain PyMuPDF text is the default (fast). Opt into pymupdf4llm for tables.
 
-    The lightweight writer (layout network off) is the fast extractor: heading
-    marks and pipe tables, without marker-pdf. pypdfium2 would keep plain text
-    only. TOC and font geometry stay on this PyMuPDF document. {} means the
-    caller should use the PyMuPDF text plus OCR path instead.
+    Judging textbooks are 600+ pages — markdown mode is ~0.25s/page (~2–3 min).
+    Set SIXCALL_MARKDOWN_EXTRACT=1 when you need pipe tables / markdown headings.
+    page_count kept for call-site stability.
+    """
+    del page_count
+    flag = os.getenv("SIXCALL_MARKDOWN_EXTRACT", "0").strip().lower()
+    return flag in {"1", "true", "yes", "on"}
+
+
+def _markdown_by_page(doc: fitz.Document) -> dict[int, str]:
+    """Markdown page bodies from pymupdf4llm (layout network off).
+
+    TOC and font geometry stay on the PyMuPDF document. {} means the caller
+    should use the PyMuPDF text plus OCR path instead.
     """
     try:
         import pymupdf4llm
@@ -222,17 +239,33 @@ def _markdown_by_page(doc: fitz.Document) -> dict[int, str]:
 
 
 def _page_bodies(doc: fitz.Document) -> dict[int, str]:
-    """Prefer pymupdf4llm markdown. Scanned or empty pages use PyMuPDF plus OCR."""
-    markdown = _markdown_by_page(doc)
+    """Prefer pymupdf4llm markdown for every page count; fall back to PyMuPDF text."""
     pages: dict[int, str] = {}
+    use_md = _markdown_extract_enabled(doc.page_count)
+    markdown = _markdown_by_page(doc) if use_md else {}
+    if use_md:
+        logger.info(
+            "extract_pages mode=markdown pages=%s md_pages=%s",
+            doc.page_count,
+            len(markdown),
+        )
+    else:
+        logger.info("extract_pages mode=fast_text pages=%s", doc.page_count)
     for index in range(doc.page_count):
         page_no = index + 1
-        body = clean_page_text(markdown.get(page_no, ""))
-        if body and not needs_ocr(body):
-            pages[page_no] = body
-            continue
+        if use_md:
+            body = clean_page_text(markdown.get(page_no, ""))
+            if body and not needs_ocr(body):
+                pages[page_no] = body
+                continue
         pages[page_no] = _extract_page_text(doc.load_page(index))
+        if page_no % 100 == 0:
+            logger.info("extract_pages progress %s/%s", page_no, doc.page_count)
     return pages
+
+
+def _ocr_enabled() -> bool:
+    return os.getenv("SIXCALL_OCR", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _extract_page_text(page: fitz.Page) -> str:
@@ -242,7 +275,7 @@ def _extract_page_text(page: fitz.Page) -> str:
     except TypeError:
         text = page.get_text("text", sort=True) or ""
     text = clean_page_text(text)
-    if needs_ocr(text):
+    if _ocr_enabled() and needs_ocr(text):
         try:
             tp = page.get_textpage_ocr(language="eng", dpi=200, full=False)
             try:
@@ -644,25 +677,118 @@ def _lookup_single(rec: DocRecord, keyword: str) -> list[int]:
     return _phrase_pages(rec.pages, keyword, candidates)
 
 
+def _normalize_keyword_list(keyword: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    if keyword is None:
+        return []
+    if isinstance(keyword, str):
+        items = [keyword]
+    else:
+        items = list(keyword)
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        term = str(raw or "").strip()
+        if not term:
+            continue
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(term)
+    return out
+
+
+def _search_one_keyword(rec: DocRecord, keyword: str) -> list[int]:
+    """Precision first; stemmed recall only when precision names nothing."""
+    keyword = (keyword or "").strip()
+    if not keyword:
+        return []
+    aliases = keyword_aliases(keyword)
+    precise: set[int] = set()
+    for alias in aliases:
+        hit = precision_lookup(rec.precision_index, alias)
+        if hit:
+            precise.update(int(p) for p in hit)
+    if precise:
+        return sorted(precise)
+    hits: set[int] = set()
+    for alias in aliases:
+        for page in _lookup_single(rec, alias):
+            hits.add(int(page))
+    return sorted(hits)
+
+
+def _rank_pages_by_pin_overlap(
+    pins: list[str],
+    hit_map: dict[str, set[int]],
+) -> list[int]:
+    """Prefer pages that contain all pins, then adjacent pairs, then singles.
+
+    Soft fallthrough: empty full-intersection does not wipe the list.
+    """
+    atoms = [p for p in pins if len(p.split()) == 1]
+    phrases = [p for p in pins if len(p.split()) > 1]
+    pool: set[int] = set()
+    for pages in hit_map.values():
+        pool.update(pages)
+    if not pool:
+        return []
+
+    scored: list[tuple[int, int]] = []
+    for page in pool:
+        score = 0
+        atom_hits = [a for a in atoms if page in hit_map.get(a, ())]
+        if atoms and len(atom_hits) == len(atoms):
+            score += 1000 + 50 * len(atoms)
+        elif len(atom_hits) >= 2:
+            score += 200 + 40 * len(atom_hits)
+        elif len(atom_hits) == 1:
+            score += 20
+
+        for i in range(len(atoms) - 1):
+            left, right = atoms[i], atoms[i + 1]
+            if page in hit_map.get(left, ()) and page in hit_map.get(right, ()):
+                score += 120
+
+        for phrase in phrases:
+            if page in hit_map.get(phrase, ()):
+                score += 250
+
+        if score > 0:
+            scored.append((score, page))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [page for _score, page in scored]
+
+
 class DocumentStore:
     def __init__(
         self, persist_dir: Path | None = None, *, use_db: bool | None = None
     ) -> None:
         self.persist_dir = Path(persist_dir or DOC_STORE_DIR)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
-        # Remote DB only for the default app store — never for test temp dirs.
-        # SIXCALL_USE_DB=0 keeps the CLI demo on local JSON even if DATABASE_URL is set.
+        # Local JSON is the fast cache. When DATABASE_URL is set, Postgres is
+        # synced in the background after a successful local write.
+        # SIXCALL_USE_DB=0 forces local-only (tests / offline demo).
         if use_db is not None:
             self.use_db = bool(use_db)
         else:
-            flag = os.getenv("SIXCALL_USE_DB", "auto").strip().lower()
+            from app.config import SIXCALL_USE_DB
+            from app.db.connection import db_enabled
+
+            flag = SIXCALL_USE_DB
             if flag in {"0", "false", "no", "off"}:
                 self.use_db = False
             elif flag in {"1", "true", "yes", "on"}:
                 self.use_db = True
             else:
-                self.use_db = self.persist_dir.resolve() == Path(DOC_STORE_DIR).resolve()
+                # auto: DB whenever URL is set AND this is the default app store
+                self.use_db = db_enabled() and (
+                    self.persist_dir.resolve() == Path(DOC_STORE_DIR).resolve()
+                )
         self._docs: dict[str, DocRecord] = {}
+        self._sync_lock = threading.Lock()
+        self._syncing: set[str] = set()
         self._load_all()
 
     def _path_for(self, doc_id: str) -> Path:
@@ -707,33 +833,77 @@ class DocumentStore:
         return rec, changed
 
     def _load_all(self) -> None:
+        """Local JSON first (sync). Postgres gap-fill is background — never blocks chat."""
+        loaded = self._load_local_catalogs()
+        if loaded:
+            logger.info(
+                "store_loaded_local docs=%d dir=%s serve=local_memory",
+                loaded,
+                self.persist_dir.name,
+            )
+
+        if not self.use_db:
+            return
+
+        from app.db.connection import db_enabled
+
+        if not db_enabled():
+            raise RuntimeError(
+                "Store use_db=True but DATABASE_URL is empty. "
+                "Set DATABASE_URL or SIXCALL_USE_DB=0 for local-only."
+            )
+        # Do not wait on Supabase here — ingest/ask must use local memory ASAP.
+        threading.Thread(
+            target=self._hydrate_from_db_background,
+            daemon=True,
+            name="sixcall-db-hydrate",
+        ).start()
+
+    def _hydrate_from_db_background(self) -> None:
+        """Pull remote-only docs into memory. Never replace an existing local catalog."""
+        from app.db.repository import load_all_documents
+
+        try:
+            db_ids: set[str] = set()
+            added = 0
+            for rec in load_all_documents():
+                db_ids.add(rec.doc_id)
+                if rec.doc_id in self._docs:
+                    continue
+                rec, changed = self._repair_record(rec)
+                self._docs[rec.doc_id] = rec
+                # Mirror to disk so the next restart stays local-first.
+                self._persist_local(rec)
+                added += 1
+            for doc_id in list(self._docs):
+                if doc_id not in db_ids:
+                    self._enqueue_db_sync(doc_id)
+            logger.info(
+                "store_db_hydrate_ok added=%d total=%d serve=local_memory",
+                added,
+                len(self._docs),
+            )
+        except Exception:
+            logger.exception(
+                "store_db_hydrate_failed — continuing with local cache docs=%d",
+                len(self._docs),
+            )
+
+    def _load_local_catalogs(self) -> int:
+        """Load full local JSON catalogs (skip thin postgres markers)."""
         loaded = 0
-        if self.use_db:
-            try:
-                from app.db.connection import db_enabled
-                from app.db.repository import load_all_documents
-
-                if db_enabled():
-                    for rec in load_all_documents():
-                        rec, changed = self._repair_record(rec)
-                        self._docs[rec.doc_id] = rec
-                        if changed:
-                            self._persist(rec)
-                        loaded += 1
-                    if loaded:
-                        logger.info("store_loaded_db docs=%d", loaded)
-                        return
-            except Exception as exc:
-                logger.warning("store_db_load_failed error=%s", type(exc).__name__)
-
         for path in sorted(self.persist_dir.glob("*.json")):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
+                if data.get("stored_in") == "postgres" and "pages" not in data:
+                    continue
+                if not data.get("pages"):
+                    continue
                 rec = DocRecord.from_jsonable(data)
                 rec, changed = self._repair_record(rec)
                 self._docs[rec.doc_id] = rec
                 if changed:
-                    self._persist(rec)
+                    self._persist_local(rec)
                 loaded += 1
             except Exception as exc:
                 logger.warning(
@@ -741,27 +911,156 @@ class DocumentStore:
                     path.name,
                     type(exc).__name__,
                 )
-        if loaded:
-            logger.info("store_loaded docs=%d dir=%s", loaded, self.persist_dir.name)
+        return loaded
 
-    def _persist(self, rec: DocRecord) -> None:
+    def _import_local_json_to_db(self) -> int:
+        """Enqueue full local JSON catalogs that are not yet in memory/DB."""
+        imported = 0
+        for path in sorted(self.persist_dir.glob("*.json")):
+            doc_id = path.stem
+            if doc_id in self._docs:
+                self._enqueue_db_sync(doc_id)
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if data.get("stored_in") == "postgres" or "pages" not in data:
+                    continue
+                if not data.get("pages"):
+                    continue
+                rec = DocRecord.from_jsonable(data)
+                rec, _ = self._repair_record(rec)
+                self._docs[rec.doc_id] = rec
+                self._persist_local(rec)
+                self._enqueue_db_sync(rec.doc_id)
+                imported += 1
+                logger.info("store_imported_local_to_db doc_id=%s", rec.doc_id)
+            except Exception:
+                logger.exception("store_import_local_failed path=%s", path.name)
+                raise
+        return imported
+
+    def _persist_local(self, rec: DocRecord) -> None:
+        """Write full catalog JSON to disk (fast local cache)."""
         path = self._path_for(rec.doc_id)
         path.write_text(
             json.dumps(rec.to_jsonable(), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        if not self.use_db:
+
+    def _enqueue_db_sync(self, doc_id: str) -> None:
+        if not self.use_db or not doc_id:
             return
+        with self._sync_lock:
+            if doc_id in self._syncing:
+                return
+            self._syncing.add(doc_id)
+        threading.Thread(
+            target=self._db_sync_worker,
+            args=(doc_id,),
+            daemon=True,
+            name=f"sixcall-db-sync-{doc_id[:8]}",
+        ).start()
+
+    def _db_sync_worker(self, doc_id: str) -> None:
+        """Push local catalog to Postgres. Serving stays on memory/local JSON."""
+        from app.logging_setup import step
+
         try:
+            rec = self._docs.get(doc_id) or self._read_full_local(doc_id)
+            if rec is None:
+                step("INGEST", "db_sync skip", doc_id=doc_id, reason="missing")
+                return
+            from app.db.connection import db_enabled
             from app.db.repository import save_document
 
+            if not db_enabled():
+                step("INGEST", "db_sync skip", doc_id=doc_id, reason="no_database")
+                return
+            step("INGEST", "db_sync …", doc_id=doc_id, pages=len(rec.pages))
+            t0 = time.perf_counter()
             save_document(rec)
-        except Exception as exc:
-            logger.warning(
-                "store_db_persist_failed doc_id=%s error=%s",
-                rec.doc_id,
-                type(exc).__name__,
+            # Keep the full in-memory + disk catalog; never thin-swap to Postgres.
+            if doc_id not in self._docs:
+                self._docs[doc_id] = rec
+            step(
+                "INGEST",
+                "db_sync ok",
+                doc_id=doc_id,
+                pages=len(rec.pages),
+                elapsed_ms=(time.perf_counter() - t0) * 1000,
+                serve="local_memory",
             )
+        except Exception as exc:
+            logger.exception("store_db_persist_failed doc_id=%s", doc_id)
+            step(
+                "INGEST",
+                "db_sync FAIL",
+                level=logging.ERROR,
+                doc_id=doc_id,
+                error=type(exc).__name__,
+            )
+        finally:
+            with self._sync_lock:
+                self._syncing.discard(doc_id)
+
+    def _persist(self, rec: DocRecord) -> None:
+        """Local cache first (required). Postgres sync is background when use_db."""
+        self._persist_local(rec)
+        if self.use_db:
+            self._enqueue_db_sync(rec.doc_id)
+
+    def _read_full_local(self, doc_id: str) -> DocRecord | None:
+        path = self._path_for(doc_id)
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if data.get("stored_in") == "postgres" and "pages" not in data:
+            return None
+        if not data.get("pages"):
+            return None
+        try:
+            return DocRecord.from_jsonable(data)
+        except Exception:
+            return None
+
+    def _load_disk_cache(
+        self,
+        doc_id: str,
+        content_sha: str,
+        owner_id: str | None,
+    ) -> DocRecord | None:
+        """Reload a previously parsed catalog from local JSON (no re-parse)."""
+        rec = self._read_full_local(doc_id)
+        if rec is not None:
+            self._docs[rec.doc_id] = rec
+            return rec
+        want = (content_sha or "").strip().lower()
+        if len(want) != 16:
+            return None
+        for path in sorted(self.persist_dir.glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not data.get("pages"):
+                continue
+            meta = data.get("meta") or {}
+            got = str(meta.get("content_sha256_16") or "").strip().lower()
+            if got != want:
+                continue
+            if owner_id and owner_id != "local":
+                if str(meta.get("owner_id") or "") != str(owner_id):
+                    continue
+            try:
+                rec = DocRecord.from_jsonable(data)
+            except Exception:
+                continue
+            self._docs[rec.doc_id] = rec
+            return rec
+        return None
 
     def get(self, doc_id: str) -> DocRecord | None:
         """Return the in-memory record for doc_id, or None if missing."""
@@ -866,32 +1165,26 @@ class DocumentStore:
         # Re-apply cleaner so older ingested pages pick up extractor fixes.
         return clean_page_text(rec.pages[page_number])
 
-    def search_keyword(self, doc_id: str, keyword: str) -> list[int]:
-        """Return sorted page numbers matching keyword (and known aliases).
+    def search_keyword(
+        self, doc_id: str, keyword: str | list[str] | tuple[str, ...] | None
+    ) -> list[int]:
+        """Return page numbers for one keyword or a ranked multi-pin list.
 
-        Empty or whitespace-only keyword returns []. Does not burn budget;
-        the tool wrapper owns call counting.
+        A string keeps the old precision→recall path. A list spends one tool
+        call: look up each pin (token/phrase contains via the indexes), then
+        rank pages by full overlap → adjacent pairs → singles.
         """
         rec = self._require(doc_id)
-        keyword = (keyword or "").strip()
-        if not keyword:
+        pins = _normalize_keyword_list(keyword)
+        if not pins:
             return []
+        if len(pins) == 1:
+            return _search_one_keyword(rec, pins[0])
 
-        aliases = keyword_aliases(keyword)
-        precise: set[int] = set()
-        for alias in aliases:
-            hit = precision_lookup(rec.precision_index, alias)
-            if hit:
-                precise.update(int(p) for p in hit)
-        if precise:
-            # Precision named pages. Do not union the stemmed map onto them.
-            return sorted(precise)
-        # Recall is a soft fill only when precision names no pages.
-        hits: set[int] = set()
-        for alias in aliases:
-            for page in _lookup_single(rec, alias):
-                hits.add(int(page))
-        return sorted(hits)
+        hit_map: dict[str, set[int]] = {}
+        for pin in pins:
+            hit_map[pin] = set(_search_one_keyword(rec, pin))
+        return _rank_pages_by_pin_overlap(pins, hit_map)
 
     def _require(self, doc_id: str) -> DocRecord:
         if not (doc_id or "").strip():
@@ -901,99 +1194,216 @@ class DocumentStore:
             raise UnknownDocumentError(doc_id)
         return rec
 
+    def _find_owned_by_content(
+        self, content_sha16: str, owner_id: str | None
+    ) -> DocRecord | None:
+        """Reuse an already-parsed doc with the same file bytes for this owner."""
+        want = (content_sha16 or "").strip().lower()
+        if len(want) != 16:
+            return None
+        for rec in self._docs.values():
+            got = str(rec.meta.get("content_sha256_16") or "").strip().lower()
+            if got != want:
+                continue
+            if owner_id and owner_id != "local":
+                if str(rec.meta.get("owner_id") or "") != str(owner_id):
+                    continue
+            return rec
+        return None
+
+    def _ensure_pdf_bytes(self, doc_id: str, file_bytes: bytes) -> None:
+        """Write original PDF only when missing or size differs (skip duplicate rewrites)."""
+        path = self._pdf_path_for(doc_id)
+        if path.is_file() and path.stat().st_size == len(file_bytes):
+            return
+        path.write_bytes(file_bytes)
+
     def ingest_pdf(self, path: str | Path, *, owner_id: str | None = None, source_name: str | None = None) -> str:
         """Parse a PDF into pages/headings/keyword map; return stable doc_id.
 
         Without owner: doc_id = sha256(file_bytes)[:16].
         With owner: doc_id = sha256(owner_id + ':' + file_bytes)[:16] so tenants isolate.
-        Idempotent for the same owner + bytes.
+        Idempotent for the same owner + bytes (skips parse when already stored).
         """
         pdf_path = Path(path).expanduser().resolve()
         if not pdf_path.exists():
             raise FileNotFoundError(str(pdf_path))
         if not pdf_path.is_file():
             raise FileNotFoundError(f"not a file: {pdf_path}")
+        display = source_name or pdf_path.name
+        return self.ingest_bytes(
+            pdf_path.read_bytes(),
+            owner_id=owner_id,
+            source_name=display,
+        )
 
-        file_bytes = pdf_path.read_bytes()
+    def ingest_bytes(
+        self,
+        file_bytes: bytes,
+        *,
+        owner_id: str | None = None,
+        source_name: str | None = None,
+    ) -> str:
+        """Ingest from raw PDF bytes. Same owner + bytes → reuse existing doc (no re-parse)."""
+        from app.logging_setup import StageTimer, step
+
+        if not file_bytes:
+            raise ValueError("empty PDF bytes")
+        content_sha = hashlib.sha256(file_bytes).hexdigest()[:16]
         if owner_id and owner_id != "local":
             doc_id = hashlib.sha256(f"{owner_id}:".encode() + file_bytes).hexdigest()[:16]
         else:
-            doc_id = hashlib.sha256(file_bytes).hexdigest()[:16]
-        if doc_id in self._docs:
-            rec = self._docs[doc_id]
+            doc_id = content_sha
+
+        existing = self._docs.get(doc_id) or self._find_owned_by_content(
+            content_sha, owner_id
+        )
+        if existing is None:
+            existing = self._load_disk_cache(doc_id, content_sha, owner_id)
+        if existing is not None:
+            doc_id = existing.doc_id
+            rec = existing
             changed = False
             if owner_id and owner_id != "local":
                 if rec.meta.get("owner_id") != owner_id:
                     rec.meta["owner_id"] = owner_id
                     changed = True
+            if not rec.meta.get("content_sha256_16"):
+                rec.meta["content_sha256_16"] = content_sha
+                changed = True
             if source_name and rec.meta.get("source_name") != source_name:
                 rec.meta.update(source_name=source_name, title=Path(source_name).stem)
                 rec.meta.pop("source_path", None)
                 changed = True
-            # Keep/restore original PDF bytes for real preview.
-            self._save_pdf_bytes(doc_id, file_bytes)
+            self._ensure_pdf_bytes(doc_id, file_bytes)
             if changed:
                 self._persist(rec)
-            logger.info(
-                "ingest_cached doc_id=%s source_name=%s",
-                doc_id,
-                pdf_path.name,
-            )
-            return doc_id
-
-        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-            pages = _page_bodies(doc)
-            labels: dict[int, str] = {}
-            for i in range(doc.page_count):
-                page_no = i + 1
-                try:
-                    labels[page_no] = str(doc.load_page(i).get_label() or page_no)
-                except Exception:
-                    labels[page_no] = str(page_no)
-
-            pages = remove_repeated_headers_footers(pages)
-            pages = {n: clean_page_text(t) for n, t in pages.items()}
-
-            headings, heading_source = _build_section_tree(doc, pages)
-            index = build_inverted_index(pages)
-            precision_index = build_precision_index(pages)
-
-            meta_title = (doc.metadata or {}).get("title") or ""
-            meta = {
-                "title": clean_page_text(meta_title) or pdf_path.stem,
-                "source_path": str(pdf_path),
-                "source_name": pdf_path.name,
-                "page_count": doc.page_count,
-                "content_sha256_16": hashlib.sha256(file_bytes).hexdigest()[:16],
-                "sha256_16": doc_id,
-                "heading_source": heading_source,
-            }
-            if owner_id and owner_id != "local":
-                meta["owner_id"] = owner_id
-            rec = DocRecord(
+            step(
+                "INGEST",
+                "cache hit — skip parse",
                 doc_id=doc_id,
-                meta=meta,
-                pages=pages,
-                labels=labels,
-                headings=headings,
-                index=index,
-                precision_index=precision_index,
-            )
-            self._docs[doc_id] = rec
-            if source_name:
-                rec.meta.update(source_name=source_name, title=Path(source_name).stem)
-                rec.meta.pop("source_path", None)
-            self._save_pdf_bytes(doc_id, file_bytes)
-            self._persist(rec)
-            logger.info(
-                "ingest_ok doc_id=%s source_name=%s pages=%d headings=%d index_terms=%d",
-                doc_id,
-                pdf_path.name,
-                meta["page_count"],
-                len(headings),
-                len(index),
+                source_name=source_name or rec.meta.get("source_name"),
+                pages=rec.meta.get("page_count"),
             )
             return doc_id
+
+        # Join an in-flight parse for this doc_id instead of double-extracting.
+        leader = False
+        gate: threading.Event
+        with _INGEST_GATE_LOCK:
+            gate = _INGEST_GATES.get(doc_id) or threading.Event()
+            if doc_id not in _INGEST_GATES:
+                _INGEST_GATES[doc_id] = gate
+                leader = True
+        if not leader:
+            step("INGEST", "wait peer parse", doc_id=doc_id)
+            gate.wait(timeout=300)
+            cached = self._docs.get(doc_id) or self._find_owned_by_content(
+                content_sha, owner_id
+            )
+            if cached is not None:
+                step(
+                    "INGEST",
+                    "cache hit — peer finished",
+                    doc_id=cached.doc_id,
+                    pages=cached.meta.get("page_count"),
+                )
+                return cached.doc_id
+            raise RuntimeError("concurrent ingest failed for this document")
+
+        step(
+            "INGEST",
+            "parse start",
+            doc_id=doc_id,
+            source_name=source_name,
+            bytes=len(file_bytes),
+            db=bool(self.use_db),
+        )
+
+        try:
+            with StageTimer("INGEST", "open_pdf", bytes=len(file_bytes)):
+                doc = fitz.open(stream=file_bytes, filetype="pdf")
+
+            try:
+                with StageTimer("INGEST", "extract_pages", pdf_pages=doc.page_count) as st:
+                    pages = _page_bodies(doc)
+                    st.detail(text_pages=len(pages))
+
+                with StageTimer("INGEST", "page_labels", pdf_pages=doc.page_count):
+                    labels: dict[int, str] = {}
+                    for i in range(doc.page_count):
+                        page_no = i + 1
+                        try:
+                            labels[page_no] = str(doc.load_page(i).get_label() or page_no)
+                        except Exception:
+                            labels[page_no] = str(page_no)
+
+                with StageTimer("INGEST", "clean_text", pages=len(pages)) as st:
+                    pages = remove_repeated_headers_footers(pages)
+                    pages = {n: clean_page_text(t) for n, t in pages.items()}
+                    st.detail(pages=len(pages))
+
+                with StageTimer("INGEST", "build_headings", pages=len(pages)) as st:
+                    headings, heading_source = _build_section_tree(doc, pages)
+                    st.detail(headings=len(headings), source=heading_source)
+
+                with StageTimer("INGEST", "build_indexes", pages=len(pages)) as st:
+                    index = build_inverted_index(pages)
+                    precision_index = build_precision_index(pages)
+                    st.detail(index_terms=len(index), precision_terms=len(precision_index))
+
+                meta_title = (doc.metadata or {}).get("title") or ""
+                stem = Path(source_name).stem if source_name else "document"
+                meta = {
+                    "title": clean_page_text(meta_title) or stem,
+                    "source_name": source_name or stem,
+                    "page_count": doc.page_count,
+                    "content_sha256_16": content_sha,
+                    "sha256_16": doc_id,
+                    "heading_source": heading_source,
+                }
+                if owner_id and owner_id != "local":
+                    meta["owner_id"] = owner_id
+                rec = DocRecord(
+                    doc_id=doc_id,
+                    meta=meta,
+                    pages=pages,
+                    labels=labels,
+                    headings=headings,
+                    index=index,
+                    precision_index=precision_index,
+                )
+                self._docs[doc_id] = rec
+
+                with StageTimer("INGEST", "store_pdf_bytes", doc_id=doc_id):
+                    self._ensure_pdf_bytes(doc_id, file_bytes)
+
+                with StageTimer(
+                    "INGEST",
+                    "local_cache",
+                    doc_id=doc_id,
+                    pages=meta["page_count"],
+                    db_async=bool(self.use_db),
+                ):
+                    self._persist(rec)
+            finally:
+                doc.close()
+
+            step(
+                "INGEST",
+                "parse complete",
+                doc_id=doc_id,
+                source_name=meta.get("source_name"),
+                pages=meta["page_count"],
+                headings=len(headings),
+                index_terms=len(index),
+                note="db sync runs in background" if self.use_db else "local-only",
+            )
+            return doc_id
+        finally:
+            with _INGEST_GATE_LOCK:
+                _INGEST_GATES.pop(doc_id, None)
+            gate.set()
 
     def delete_document(self, doc_id: str, *, owner_id: str | None = None) -> bool:
         """Remove one document from memory, disk, and Postgres (owner-scoped)."""
