@@ -179,26 +179,61 @@ def test_ingest_writes_local_cache_before_db_and_does_not_block(tmp_path: Path, 
 
     monkeypatch.setattr("app.db.repository.save_document", slow_save)
 
-    store = DocumentStore(tmp_path / "docs", use_db=True)
+    store = DocumentStore(tmp_path / "docs", use_db=True, disk_cache="staging")
     pdf = tmp_path / "policy.pdf"
     _make_pdf(pdf, ["Refund window is 14 days."])
     raw = pdf.read_bytes()
 
     doc_id = store.ingest_bytes(raw, owner_id="user-a", source_name="policy.pdf")
 
-    # Must not wait for the 0.5s DB write — local cache is enough to return.
+    # Must not wait for the 0.5s DB write — staged disk + memory are enough.
     assert not finished.is_set(), "ingest blocked until DB save finished"
     cache = tmp_path / "docs" / f"{doc_id}.json"
     assert cache.is_file()
     payload = json.loads(cache.read_text(encoding="utf-8"))
     assert "pages" in payload and payload["pages"]
     assert store.get(doc_id) is not None
-    # Ask path keeps using local memory even while/after DB sync.
     assert store.get_page(doc_id, 1)
 
     assert started.wait(2.0), "background DB sync never started"
     assert finished.wait(2.0), "background DB sync never finished"
-    assert store.get(doc_id) is not None
+    # Purge runs right after save returns — wait briefly for unlink.
+    for _ in range(50):
+        if not cache.exists():
+            break
+        time.sleep(0.02)
+    assert not cache.exists()
+    assert store.get_page(doc_id, 1)
+
+
+def test_ingest_without_disk_waits_for_supabase(tmp_path: Path, monkeypatch) -> None:
+    """Render mode: no .data/docs — durable write must finish before HTTP returns."""
+    import threading
+    import time
+
+    from app.store.document_store import DocumentStore
+
+    monkeypatch.setattr("app.db.connection.db_enabled", lambda: True)
+    monkeypatch.setattr("app.db.repository.load_all_documents", lambda **kw: [])
+
+    finished = threading.Event()
+
+    def slow_save(rec) -> None:
+        time.sleep(0.2)
+        finished.set()
+
+    monkeypatch.setattr("app.db.repository.save_document", slow_save)
+
+    store = DocumentStore(tmp_path / "docs", use_db=True, disk_cache=False)
+    pdf = tmp_path / "policy.pdf"
+    _make_pdf(pdf, ["Refund window is 14 days."])
+    doc_id = store.ingest_bytes(
+        pdf.read_bytes(), owner_id="user-a", source_name="policy.pdf"
+    )
+
+    assert finished.is_set(), "ingest returned before Supabase save finished"
+    assert not (tmp_path / "docs" / f"{doc_id}.json").exists()
+    assert store.get_page(doc_id, 1)
 
 
 def test_store_startup_does_not_block_on_remote_hydrate(tmp_path: Path, monkeypatch) -> None:
@@ -230,7 +265,11 @@ def test_store_startup_does_not_block_on_remote_hydrate(tmp_path: Path, monkeypa
 
 def test_ingest_reuses_disk_cache_without_reparse(tmp_path: Path, monkeypatch) -> None:
     """Same owner+bytes after memory wipe reloads local JSON — no pymupdf reopen."""
-    store = reset_store_for_tests(tmp_path / "docs")
+    from app.store.document_store import DocumentStore
+    from app.store import document_store as ds_mod
+
+    store = DocumentStore(tmp_path / "docs", use_db=False, disk_cache="keep")
+    ds_mod._STORE = store
     pdf = tmp_path / "cs.pdf"
     _make_pdf(pdf, ["Computer Science is about problem solving."])
     raw = pdf.read_bytes()

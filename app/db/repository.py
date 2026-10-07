@@ -170,6 +170,69 @@ def save_document(rec: DocRecord) -> None:
     )
 
 
+def _record_from_doc_row(conn: Any, row: dict[str, Any]) -> DocRecord:
+    doc_id = row["doc_id"]
+    meta = row["meta"] if isinstance(row["meta"], dict) else json.loads(row["meta"] or "{}")
+    index = (
+        row["keyword_index"]
+        if isinstance(row["keyword_index"], dict)
+        else json.loads(row["keyword_index"] or "{}")
+    )
+    pages_rows = conn.execute(
+        "SELECT page_number, body, label FROM pages WHERE doc_id = %s ORDER BY page_number",
+        (doc_id,),
+    ).fetchall()
+    headings_rows = conn.execute(
+        """
+        SELECT title, level, start_page, end_page
+        FROM headings WHERE doc_id = %s ORDER BY ord, id
+        """,
+        (doc_id,),
+    ).fetchall()
+    pages = {int(r["page_number"]): r["body"] or "" for r in pages_rows}
+    labels = {
+        int(r["page_number"]): str(r["label"] or r["page_number"]) for r in pages_rows
+    }
+    headings = [
+        Heading(
+            title=r["title"],
+            level=int(r["level"]),
+            start=int(r["start_page"]),
+            end=int(r["end_page"]),
+        )
+        for r in headings_rows
+    ]
+    precision_raw = meta.get("precision_index") if isinstance(meta, dict) else None
+    precision_index = (
+        {k: list(v) for k, v in precision_raw.items()}
+        if isinstance(precision_raw, dict)
+        else {}
+    )
+    return DocRecord(
+        doc_id=doc_id,
+        meta=meta if isinstance(meta, dict) else {},
+        pages=pages,
+        labels=labels,
+        headings=headings,
+        index={k: list(v) for k, v in (index or {}).items()},
+        precision_index=precision_index,
+    )
+
+
+def load_document(doc_id: str) -> DocRecord | None:
+    """Load one full catalog from Postgres (pages + headings + indexes)."""
+    if not db_enabled() or not (doc_id or "").strip():
+        return None
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT doc_id, meta, keyword_index FROM documents WHERE doc_id = %s",
+            (doc_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return _record_from_doc_row(conn, row)
+
+
 def load_all_documents(*, owner_id: str | None = None) -> list[DocRecord]:
     if not db_enabled():
         return []
@@ -189,54 +252,7 @@ def load_all_documents(*, owner_id: str | None = None) -> list[DocRecord]:
                 "SELECT doc_id, meta, keyword_index FROM documents ORDER BY title, doc_id"
             ).fetchall()
         for row in docs:
-            doc_id = row["doc_id"]
-            meta = row["meta"] if isinstance(row["meta"], dict) else json.loads(row["meta"] or "{}")
-            index = (
-                row["keyword_index"]
-                if isinstance(row["keyword_index"], dict)
-                else json.loads(row["keyword_index"] or "{}")
-            )
-            pages_rows = conn.execute(
-                "SELECT page_number, body, label FROM pages WHERE doc_id = %s ORDER BY page_number",
-                (doc_id,),
-            ).fetchall()
-            headings_rows = conn.execute(
-                """
-                SELECT title, level, start_page, end_page
-                FROM headings WHERE doc_id = %s ORDER BY ord, id
-                """,
-                (doc_id,),
-            ).fetchall()
-            pages = {int(r["page_number"]): r["body"] or "" for r in pages_rows}
-            labels = {
-                int(r["page_number"]): str(r["label"] or r["page_number"]) for r in pages_rows
-            }
-            headings = [
-                Heading(
-                    title=r["title"],
-                    level=int(r["level"]),
-                    start=int(r["start_page"]),
-                    end=int(r["end_page"]),
-                )
-                for r in headings_rows
-            ]
-            precision_raw = meta.get("precision_index") if isinstance(meta, dict) else None
-            precision_index = (
-                {k: list(v) for k, v in precision_raw.items()}
-                if isinstance(precision_raw, dict)
-                else {}
-            )
-            out.append(
-                DocRecord(
-                    doc_id=doc_id,
-                    meta=meta,
-                    pages=pages,
-                    labels=labels,
-                    headings=headings,
-                    index={k: list(v) for k, v in (index or {}).items()},
-                    precision_index=precision_index,
-                )
-            )
+            out.append(_record_from_doc_row(conn, row))
     logger.info("db_load_documents count=%d", len(out))
     return out
 

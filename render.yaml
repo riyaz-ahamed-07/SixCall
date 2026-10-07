@@ -1,0 +1,40 @@
+# Render Blueprint — SixCall FastAPI backend
+# Dashboard: New → Blueprint → connect this repo, or create Web Service manually.
+# Free plan: ephemeral disk; staging mode + Supabase keep uploads durable.
+
+services:
+  - type: web
+    name: sixcall-api
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DOC_STORE_DIR
+        value: /tmp/sixcall/docs
+      - key: SIXCALL_DISK_CACHE
+        value: staging
+      - key: SIXCALL_MARKDOWN_EXTRACT
+        value: "0"
+      - key: SIXCALL_OCR
+        value: "0"
+      - key: SIXCALL_USE_DB
+        value: auto
+      - key: SIXCALL_FOLLOWUPS
+        value: "0"
+      - key: REQUEST_DEADLINE_SEC
+        value: "90"
+      - key: LLM_ATTEMPT_TIMEOUT_SEC
+        value: "45"
+      - key: CORS_ORIGINS
+        value: https://six-call.vercel.app
+      - key: DATABASE_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: LLM_PRIMARY
+        value: groq

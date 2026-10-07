@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 from app.api import ask, get_trace, list_docs, overview
+from app.config import CORS_ORIGIN_REGEX, cors_allow_origins
 from app.db.connection import db_enabled
 from app.deps import bearer_token, require_user
 from app.logging_setup import configure_logging, short, step
@@ -68,10 +69,8 @@ async def request_timing(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=cors_allow_origins(),
+    allow_origin_regex=CORS_ORIGIN_REGEX or None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

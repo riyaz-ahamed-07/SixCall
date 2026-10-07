@@ -761,15 +761,33 @@ def _rank_pages_by_pin_overlap(
     return [page for _score, page in scored]
 
 
+def _normalize_disk_mode(value: bool | str | None) -> str:
+    """Return off | keep | staging."""
+    if value is True:
+        return "keep"
+    if value is False:
+        return "off"
+    raw = str(value or "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return "off"
+    if raw in {"1", "true", "yes", "on", "keep"}:
+        return "keep"
+    if raw in {"staging", "stage", "temp", "auto"}:
+        return "staging"
+    return "staging"
+
+
 class DocumentStore:
     def __init__(
-        self, persist_dir: Path | None = None, *, use_db: bool | None = None
+        self,
+        persist_dir: Path | None = None,
+        *,
+        use_db: bool | None = None,
+        disk_cache: bool | str | None = None,
     ) -> None:
         self.persist_dir = Path(persist_dir or DOC_STORE_DIR)
-        self.persist_dir.mkdir(parents=True, exist_ok=True)
-        # Local JSON is the fast cache. When DATABASE_URL is set, Postgres is
-        # synced in the background after a successful local write.
-        # SIXCALL_USE_DB=0 forces local-only (tests / offline demo).
+        # Serve from memory. Durable store is Supabase when use_db.
+        # Disk modes: staging (local → background DB → purge disk), keep, off.
         if use_db is not None:
             self.use_db = bool(use_db)
         else:
@@ -782,10 +800,23 @@ class DocumentStore:
             elif flag in {"1", "true", "yes", "on"}:
                 self.use_db = True
             else:
-                # auto: DB whenever URL is set AND this is the default app store
                 self.use_db = db_enabled() and (
                     self.persist_dir.resolve() == Path(DOC_STORE_DIR).resolve()
                 )
+        if disk_cache is not None:
+            self.disk_mode = _normalize_disk_mode(disk_cache)
+        else:
+            from app.config import SIXCALL_DISK_CACHE
+
+            # Without DB, staging cannot promote — keep files on disk.
+            raw = SIXCALL_DISK_CACHE
+            self.disk_mode = _normalize_disk_mode(raw)
+            if not self.use_db and self.disk_mode == "staging":
+                self.disk_mode = "keep"
+        self.disk_cache = self.disk_mode != "off"
+        self.purge_disk_after_sync = self.disk_mode == "staging"
+        if self.disk_cache:
+            self.persist_dir.mkdir(parents=True, exist_ok=True)
         self._docs: dict[str, DocRecord] = {}
         self._sync_lock = threading.Lock()
         self._syncing: set[str] = set()
@@ -833,13 +864,19 @@ class DocumentStore:
         return rec, changed
 
     def _load_all(self) -> None:
-        """Local JSON first (sync). Postgres gap-fill is background — never blocks chat."""
-        loaded = self._load_local_catalogs()
+        """Optional disk catalogs, then background Supabase hydrate into memory."""
+        loaded = self._load_local_catalogs() if self.disk_cache else 0
         if loaded:
             logger.info(
-                "store_loaded_local docs=%d dir=%s serve=local_memory",
+                "store_loaded_local docs=%d dir=%s serve=memory",
                 loaded,
                 self.persist_dir.name,
+            )
+        else:
+            logger.info(
+                "store_disk_mode=%s serve=memory%s",
+                self.disk_mode,
+                "+supabase" if self.use_db else "",
             )
 
         if not self.use_db:
@@ -852,7 +889,7 @@ class DocumentStore:
                 "Store use_db=True but DATABASE_URL is empty. "
                 "Set DATABASE_URL or SIXCALL_USE_DB=0 for local-only."
             )
-        # Do not wait on Supabase here — ingest/ask must use local memory ASAP.
+        # Do not wait on Supabase here — ingest/ask must use memory ASAP.
         threading.Thread(
             target=self._hydrate_from_db_background,
             daemon=True,
@@ -860,7 +897,7 @@ class DocumentStore:
         ).start()
 
     def _hydrate_from_db_background(self) -> None:
-        """Pull remote-only docs into memory. Never replace an existing local catalog."""
+        """Pull remote docs into memory. Never replace an existing memory catalog."""
         from app.db.repository import load_all_documents
 
         try:
@@ -870,22 +907,25 @@ class DocumentStore:
                 db_ids.add(rec.doc_id)
                 if rec.doc_id in self._docs:
                     continue
-                rec, changed = self._repair_record(rec)
+                rec, _changed = self._repair_record(rec)
                 self._docs[rec.doc_id] = rec
-                # Mirror to disk so the next restart stays local-first.
-                self._persist_local(rec)
+                # staging: durable is Supabase — don't re-materialize disk copies.
+                if self.disk_mode == "keep":
+                    self._persist_local(rec)
                 added += 1
-            for doc_id in list(self._docs):
-                if doc_id not in db_ids:
-                    self._enqueue_db_sync(doc_id)
+            if self.disk_mode == "keep":
+                for doc_id in list(self._docs):
+                    if doc_id not in db_ids:
+                        self._enqueue_db_sync(doc_id)
+
             logger.info(
-                "store_db_hydrate_ok added=%d total=%d serve=local_memory",
+                "store_db_hydrate_ok added=%d total=%d serve=memory",
                 added,
                 len(self._docs),
             )
         except Exception:
             logger.exception(
-                "store_db_hydrate_failed — continuing with local cache docs=%d",
+                "store_db_hydrate_failed — continuing with memory docs=%d",
                 len(self._docs),
             )
 
@@ -940,7 +980,10 @@ class DocumentStore:
         return imported
 
     def _persist_local(self, rec: DocRecord) -> None:
-        """Write full catalog JSON to disk (fast local cache)."""
+        """Write full catalog JSON to disk when disk cache is enabled."""
+        if not self.disk_cache:
+            return
+        self.persist_dir.mkdir(parents=True, exist_ok=True)
         path = self._path_for(rec.doc_id)
         path.write_text(
             json.dumps(rec.to_jsonable(), ensure_ascii=False, indent=2),
@@ -961,8 +1004,30 @@ class DocumentStore:
             name=f"sixcall-db-sync-{doc_id[:8]}",
         ).start()
 
+    def _purge_disk_files(self, doc_id: str) -> None:
+        """Remove staged JSON/PDF after Supabase has the catalog. Memory keeps serving."""
+        removed: list[str] = []
+        for path in (self._path_for(doc_id), self._pdf_path_for(doc_id)):
+            try:
+                if path.is_file():
+                    path.unlink()
+                    removed.append(path.name)
+            except OSError as exc:
+                logger.warning(
+                    "store_disk_purge_failed doc_id=%s path=%s err=%s",
+                    doc_id,
+                    path.name,
+                    type(exc).__name__,
+                )
+        if removed:
+            logger.info(
+                "store_disk_purged doc_id=%s files=%s serve=memory durable=supabase",
+                doc_id,
+                ",".join(removed),
+            )
+
     def _db_sync_worker(self, doc_id: str) -> None:
-        """Push local catalog to Postgres. Serving stays on memory/local JSON."""
+        """Push catalog to Postgres. Optionally purge staged disk files afterward."""
         from app.logging_setup import step
 
         try:
@@ -979,16 +1044,22 @@ class DocumentStore:
             step("INGEST", "db_sync …", doc_id=doc_id, pages=len(rec.pages))
             t0 = time.perf_counter()
             save_document(rec)
-            # Keep the full in-memory + disk catalog; never thin-swap to Postgres.
+            # Ask path stays on memory; DB is the durable copy.
             if doc_id not in self._docs:
                 self._docs[doc_id] = rec
+            purged = False
+            if self.purge_disk_after_sync:
+                self._purge_disk_files(doc_id)
+                purged = True
             step(
                 "INGEST",
                 "db_sync ok",
                 doc_id=doc_id,
                 pages=len(rec.pages),
                 elapsed_ms=(time.perf_counter() - t0) * 1000,
-                serve="local_memory",
+                serve="memory",
+                durable="supabase",
+                disk_purged=purged,
             )
         except Exception as exc:
             logger.exception("store_db_persist_failed doc_id=%s", doc_id)
@@ -1004,10 +1075,31 @@ class DocumentStore:
                 self._syncing.discard(doc_id)
 
     def _persist(self, rec: DocRecord) -> None:
-        """Local cache first (required). Postgres sync is background when use_db."""
+        """Memory hot path. staging/keep write disk; off waits on Supabase."""
+        self._docs[rec.doc_id] = rec
         self._persist_local(rec)
-        if self.use_db:
+        if not self.use_db:
+            return
+        if self.disk_cache:
+            # Fast return: user can ask while Supabase sync runs concurrently.
             self._enqueue_db_sync(rec.doc_id)
+            return
+        from app.db.repository import save_document
+        from app.logging_setup import step
+
+        step("INGEST", "db_sync …", doc_id=rec.doc_id, pages=len(rec.pages), mode="sync")
+        t0 = time.perf_counter()
+        save_document(rec)
+        step(
+            "INGEST",
+            "db_sync ok",
+            doc_id=rec.doc_id,
+            pages=len(rec.pages),
+            elapsed_ms=(time.perf_counter() - t0) * 1000,
+            mode="sync",
+            serve="memory",
+            durable="supabase",
+        )
 
     def _read_full_local(self, doc_id: str) -> DocRecord | None:
         path = self._path_for(doc_id)
@@ -1026,6 +1118,25 @@ class DocumentStore:
         except Exception:
             return None
 
+    def _load_db_document(self, doc_id: str) -> DocRecord | None:
+        """Pull one catalog from Supabase into memory (no re-parse)."""
+        if not self.use_db or not (doc_id or "").strip():
+            return None
+        try:
+            from app.db.repository import load_document
+
+            rec = load_document(doc_id)
+        except Exception:
+            logger.exception("store_db_load_one_failed doc_id=%s", doc_id)
+            return None
+        if rec is None:
+            return None
+        rec, _ = self._repair_record(rec)
+        self._docs[rec.doc_id] = rec
+        if self.disk_mode == "keep":
+            self._persist_local(rec)
+        return rec
+
     def _load_disk_cache(
         self,
         doc_id: str,
@@ -1033,6 +1144,8 @@ class DocumentStore:
         owner_id: str | None,
     ) -> DocRecord | None:
         """Reload a previously parsed catalog from local JSON (no re-parse)."""
+        if not self.disk_cache:
+            return None
         rec = self._read_full_local(doc_id)
         if rec is not None:
             self._docs[rec.doc_id] = rec
@@ -1190,6 +1303,12 @@ class DocumentStore:
         if not (doc_id or "").strip():
             raise UnknownDocumentError(doc_id or "")
         rec = self._docs.get(doc_id)
+        if rec is None and self.disk_cache:
+            rec = self._read_full_local(doc_id)
+            if rec is not None:
+                self._docs[rec.doc_id] = rec
+        if rec is None:
+            rec = self._load_db_document(doc_id)
         if rec is None:
             raise UnknownDocumentError(doc_id)
         return rec
@@ -1212,7 +1331,10 @@ class DocumentStore:
         return None
 
     def _ensure_pdf_bytes(self, doc_id: str, file_bytes: bytes) -> None:
-        """Write original PDF only when missing or size differs (skip duplicate rewrites)."""
+        """Write original PDF only when disk cache is on (preview / re-open)."""
+        if not self.disk_cache:
+            return
+        self.persist_dir.mkdir(parents=True, exist_ok=True)
         path = self._pdf_path_for(doc_id)
         if path.is_file() and path.stat().st_size == len(file_bytes):
             return
@@ -1260,6 +1382,8 @@ class DocumentStore:
         )
         if existing is None:
             existing = self._load_disk_cache(doc_id, content_sha, owner_id)
+        if existing is None:
+            existing = self._load_db_document(doc_id)
         if existing is not None:
             doc_id = existing.doc_id
             rec = existing
