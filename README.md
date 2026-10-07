@@ -63,18 +63,18 @@ flowchart LR
 
 ## Technology stack
 
-| Area | Technology | Role |
-| ---- | ---------- | ---- |
-| **Web UI** | Next.js, React, TypeScript, Tailwind | Chat shell, upload, inline cite hover |
-| **API** | FastAPI, Uvicorn, python-multipart | `/ingest`, `/ask`, `/documents`, auth |
-| **PDF text** | **PyMuPDF** (default) | Fast page extract for large textbooks |
-| **PDF markdown** | pymupdf4llm (opt-in) | `SIXCALL_MARKDOWN_EXTRACT=1` for tables |
-| **Outline** | PyMuPDF TOC → fonts → lexical | Section tree at ingest |
-| **Search** | Precision index + stemmed recall | Inside one `search_keyword` call |
-| **Quote check** | Exact / fragment / RapidFuzz ≥90 | Digits + negations must match |
-| **LLM** | LiteLLM → Groq / Gemini | TOC pick (optional) + answer |
-| **DB** | Supabase Postgres (`psycopg`) | Users, sessions, async doc sync |
-| **Local cache** | `.data/docs`, `.data/traces` | Source of truth for serving |
+| Area             | Technology                           | Role                                    |
+| ---------------- | ------------------------------------ | --------------------------------------- |
+| **Web UI**       | Next.js, React, TypeScript, Tailwind | Chat shell, upload, inline cite hover   |
+| **API**          | FastAPI, Uvicorn, python-multipart   | `/ingest`, `/ask`, `/documents`, auth   |
+| **PDF text**     | **PyMuPDF** (default)                | Fast page extract for large textbooks   |
+| **PDF markdown** | pymupdf4llm (opt-in)                 | `SIXCALL_MARKDOWN_EXTRACT=1` for tables |
+| **Outline**      | PyMuPDF TOC → fonts → lexical        | Section tree at ingest                  |
+| **Search**       | Precision index + stemmed recall     | Inside one `search_keyword` call        |
+| **Quote check**  | Exact / fragment / RapidFuzz ≥90     | Digits + negations must match           |
+| **LLM**          | LiteLLM → Groq / Gemini              | TOC pick (optional) + answer            |
+| **DB**           | Supabase Postgres (`psycopg`)        | Users, sessions, async doc sync         |
+| **Local cache**  | `.data/docs`, `.data/traces`         | Source of truth for serving             |
 
 **Not used:** LangChain, LangGraph, LlamaIndex, vector RAG. Navigation is section tree + keyword pins + budgeted page reads.
 
@@ -84,19 +84,19 @@ flowchart LR
 
 The agent imports **only tool functions** (+ wrapper). It must not import `app.store` (`tests/test_no_store_leak.py`).
 
-| Layer | Owns | Sees |
-| ----- | ---- | ---- |
-| **Store / tools** | Pages, headings, dual indexes | Full document |
-| **Agent** | Pins → section match → rank → answer → verify | Tool returns for this question only |
+| Layer             | Owns                                          | Sees                                |
+| ----------------- | --------------------------------------------- | ----------------------------------- |
+| **Store / tools** | Pages, headings, dual indexes                 | Full document                       |
+| **Agent**         | Pins → section match → rank → answer → verify | Tool returns for this question only |
 
 ### The four tools
 
-| Tool | Returns | Used in `/ask`? |
-| ---- | ------- | --------------- |
-| `list_documents()` | Titles + metadata | **No** — HTTP catalog / discovery only |
-| `list_headings(doc_id)` | Outline ranges | **Yes** (usually first call) |
-| `search_keyword(doc_id, keyword\|pins)` | Ranked page numbers | **Yes** (one multi-pin call) |
-| `get_page(doc_id, page)` | One page’s cleaned text | **Yes** (budgeted reads) |
+| Tool                                    | Returns                 | Used in `/ask`?                        |
+| --------------------------------------- | ----------------------- | -------------------------------------- |
+| `list_documents()`                      | Titles + metadata       | **No** — HTTP catalog / discovery only |
+| `list_headings(doc_id)`                 | Outline ranges          | **Yes** (usually first call)           |
+| `search_keyword(doc_id, keyword\|pins)` | Ranked page numbers     | **Yes** (one multi-pin call)           |
+| `get_page(doc_id, page)`                | One page’s cleaned text | **Yes** (budgeted reads)               |
 
 `wrapper.py` logs every call and **refuses a 7th** for that `question_id`.
 
@@ -161,13 +161,15 @@ flowchart LR
   LOCAL -.->|background thread| PG["Supabase save_document"]
 ```
 
-| Setting | Default | Effect |
-| ------- | ------- | ------ |
-| `SIXCALL_MARKDOWN_EXTRACT` | `0` | Fast plain text; set `1` for markdown tables |
-| `SIXCALL_OCR` | `0` | OCR only when explicitly enabled |
-| `SIXCALL_USE_DB` | `auto` | Postgres when `DATABASE_URL` is set |
+| Setting                    | Default   | Effect                                                                                                            |
+| -------------------------- | --------- | ----------------------------------------------------------------------------------------------------------------- |
+| `SIXCALL_MARKDOWN_EXTRACT` | `0`       | Fast plain text; set `1` for markdown tables                                                                      |
+| `SIXCALL_OCR`              | `0`       | OCR only when explicitly enabled                                                                                  |
+| `SIXCALL_USE_DB`           | `auto`    | Postgres when `DATABASE_URL` is set                                                                               |
+| `SIXCALL_DISK_CACHE`       | `staging` | `staging` = local→ask immediately→background Supabase→purge disk; `keep` = leave files; `0` = no disk, wait on DB |
 
-After local persist, the doc is **ready for chat immediately**. DB hydrate on startup is also background and **never overwrites** an existing local catalog.
+**Upload path (staging):** parse → memory + `.data/docs` → HTTP returns → user can ask → concurrent Supabase sync → on success delete local JSON/PDF → later restarts load from Supabase into memory.  
+Browser `localStorage` is only chat UI state, not PDF pages.
 
 ---
 
@@ -259,6 +261,40 @@ SIXCALL_USE_DB=0
 
 Auth still needs `DATABASE_URL` if you use signup/login.
 
+### Deploy (Render API + Vercel UI) — free path
+
+Frontend: `https://six-call.vercel.app`  
+Backend: Render Web Service from `Dockerfile` + `render.yaml`.
+
+1. Push this repo to GitHub (include deploy files).
+2. [Render](https://dashboard.render.com) → **New** → **Web Service** → connect repo.
+3. Settings: **Docker**, root directory = repo root, instance **Free**.
+4. Environment (or use Blueprint `render.yaml`):
+
+| Key                               | Value                         |
+| --------------------------------- | ----------------------------- |
+| `DATABASE_URL`                    | your Supabase pooler URL      |
+| `GEMINI_API_KEY` / `GROQ_API_KEY` | real keys                     |
+| `LLM_PRIMARY`                     | `groq`                        |
+| `CORS_ORIGINS`                    | `https://six-call.vercel.app` |
+| `SIXCALL_DISK_CACHE`              | `staging`                     |
+| `DOC_STORE_DIR`                   | `/tmp/sixcall/docs`           |
+| `SIXCALL_MARKDOWN_EXTRACT`        | `0`                           |
+
+5. Deploy → note URL like `https://sixcall-api.onrender.com`.
+6. Vercel env → redeploy frontend:
+
+```env
+NEXT_PUBLIC_API_BASE=https://sixcall-api.onrender.com
+NEXT_PUBLIC_API_TIMEOUT_MS=300000
+```
+
+7. Keep-alive (optional): cron every 10 min → `GET https://sixcall-api.onrender.com/health`
+
+Smoke: `/health` then upload + ask from `https://six-call.vercel.app`.
+
+**Note:** Free Render sleeps without cron; disk is ephemeral — `staging` + Supabase keep docs after restart.
+
 ---
 
 ## API / CLI
@@ -288,14 +324,14 @@ python -m app.cli migrate
 
 ### HTTP (selected)
 
-| Method | Path | Purpose |
-| ------ | ---- | ------- |
-| `POST` | `/auth/signup`, `/auth/login` | Account + token |
-| `POST` | `/ingest` | Upload PDF → `doc_id` (local-ready) |
-| `GET` | `/documents` | List owned docs |
-| `DELETE` | `/documents/{doc_id}` | Delete one |
-| `POST` | `/ask` | Budgeted Q&A |
-| `GET` | `/health` | Liveness |
+| Method   | Path                          | Purpose                             |
+| -------- | ----------------------------- | ----------------------------------- |
+| `POST`   | `/auth/signup`, `/auth/login` | Account + token                     |
+| `POST`   | `/ingest`                     | Upload PDF → `doc_id` (local-ready) |
+| `GET`    | `/documents`                  | List owned docs                     |
+| `DELETE` | `/documents/{doc_id}`         | Delete one                          |
+| `POST`   | `/ask`                        | Budgeted Q&A                        |
+| `GET`    | `/health`                     | Liveness                            |
 
 ---
 

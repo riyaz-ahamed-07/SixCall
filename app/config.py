@@ -57,3 +57,35 @@ GROQ_MODEL_FAST = os.getenv("GROQ_MODEL_FAST", "openai/gpt-oss-20b")
 LLM_PRIMARY = os.getenv("LLM_PRIMARY", "groq").strip().lower()
 # When DATABASE_URL is set, Postgres is the source of truth (local JSON is not a catalog).
 SIXCALL_USE_DB = os.getenv("SIXCALL_USE_DB", "auto").strip().lower()
+# Disk under DOC_STORE_DIR:
+#   staging (default with DB) — write local for fast chat, background Supabase,
+#     then delete local JSON/PDF once DB has the catalog (memory keeps serving).
+#   1 / keep — leave files on disk forever (local laptop).
+#   0 / off — no disk; ingest waits for Supabase (safest on tiny ephemeral disks).
+SIXCALL_DISK_CACHE = os.getenv("SIXCALL_DISK_CACHE", "staging").strip().lower()
+
+
+def cors_allow_origins() -> list[str]:
+    """Browser origins allowed to call the API (comma-separated CORS_ORIGINS)."""
+    defaults = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://six-call.vercel.app",
+    ]
+    raw = os.getenv("CORS_ORIGINS", "").strip()
+    extras = [part.strip().rstrip("/") for part in raw.split(",") if part.strip()]
+    out: list[str] = []
+    seen: set[str] = set()
+    for origin in defaults + extras:
+        key = origin.rstrip("/")
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+# Vercel preview URLs for this project, e.g. https://six-call-git-main-….vercel.app
+CORS_ORIGIN_REGEX = os.getenv(
+    "CORS_ORIGIN_REGEX",
+    r"https://six-call(-[\w-]+)*\.vercel\.app",
+).strip()
